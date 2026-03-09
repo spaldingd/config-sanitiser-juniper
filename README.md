@@ -135,6 +135,20 @@ same value always maps to the same token within a run and across runs using the 
 seed. A routing-instance name referenced in ten places will carry the same `vrf-xxxx`
 token in all ten places in the output.
 
+### Seed confidentiality
+
+**Treat the seed as sensitive.** SHA-256 is one-way, so a token alone cannot be
+reversed to its source value. However, anyone with the seed and the script can perform
+a forward lookup: compute the expected token for any candidate value and check whether
+it matches the output. For IP addresses this is a practical threat — RFC 1918 space
+is small enough to enumerate exhaustively in seconds. For named objects the risk
+depends on whether an attacker can guess your naming conventions.
+
+The sanitised-output banner records a **16-character SHA-256 fingerprint** of the
+seed (not the seed itself). This lets two files be verified as sharing the same seed
+— and therefore having consistent, comparable tokens — without exposing the seed to
+anyone who reads the sanitised output.
+
 ---
 
 ## Token Reference
