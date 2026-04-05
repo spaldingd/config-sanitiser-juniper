@@ -478,17 +478,28 @@ descriptions, and exit without processing any files.
 | **Block-format NAT / address-book names** | Only matched in set-format | — |
 | **FQDN-based server addresses** | RADIUS/TACACS+ servers configured with a hostname rather than IP are not tokenised | — |
 | **Hostnames in descriptions** | Description token replaces the whole string; original is visible in mapping file | — |
+| **IPsec/IKE intra-stanza cross-references** | Lines that reference a named proposal, policy, or gateway *within* an enclosing stanza (e.g. `proposals IKE-PROPOSAL-BLOCK;`, `ike-policy IKE-POLICY-SITE-A;`, `gateway IKE-GW-SITE-A;`) are not tokenised — only the definition lines (`proposal NAME { }`, `policy NAME { }`, etc.) are matched. The same gap exists in set-format (e.g. `set security ike policy NAME proposals PROPOSAL-NAME` — the trailing `PROPOSAL-NAME` value is not tokenised). Definition names are consistently anonymised; the cross-reference values within a stanza are left as-is. | `sample_junos_block.conf` |
+
+---
+
+## Bugs Found and Fixed During Test Config Expansion
+
+The following script bugs were discovered by adding the previously-uncovered test
+cases and are fixed in the current version of `juniper_sanitise.py`.
+
+| Bug | Symptom | Root cause | Fix |
+|-----|---------|------------|-----|
+| **NTP key value not redacted (set-format)** | `value "ntpSecretKey1"` survived in sanitised output | The set-format NTP credential pattern used `\S+\s+` (one token) between the key ID and `value` keyword, but Junos syntax places two tokens there: `type` and the algorithm name (e.g. `md5`). The pattern never matched. | Changed `\d+\s+\S+\s+value` to `\d+[^\S\n]+(?:\S+[^\S\n]+)+value` to consume any number of intermediate tokens while preventing cross-line matching. |
+| **Block-format IPsec proposal/policy names not tokenised** | `IPSEC-PROPOSAL-BLOCK` and `IPSEC-POLICY-BLOCK` survived in sanitised output | The `proposal NAME {` and `policy NAME {` block patterns were guarded solely by `ike-proposals` and `ike-policies` respectively. When only `ipsec-proposals` or `ipsec-policies` was enabled, the shared block pattern never ran. | Restructured the guards to `if C("ike-proposals") or C("ipsec-proposals"):` so the shared block pattern fires whenever either item is enabled. |
+| **Block-format IPsec VPN names not tokenised** | `VPN-BLOCK` survived in sanitised output | No block-format pattern existed for `vpn NAME {` — the `ipsec-vpns` item only had a set-format pattern. | Added `re.compile(r'^(\s*vpn\s+)(?P<n>\S+)\s*\{', re.M)` under the `ipsec-vpns` guard. |
 
 ---
 
 ## Rules Defined but Not Exercised by Current Test Configs
 
+All previously uncovered rules are now exercised by the test configs. The table
+below is retained as a nil return for completeness.
+
 | Item ID | Syntax | Notes |
 |---------|--------|-------|
-| `certificate-data` | `certificate { ... }` block | No PKI certificate block in test configs |
-| `bgp-confederation` (block) | `confederation N;` | Only exercised in set-format |
-| `ipsec-proposals` (block) | `proposal NAME { ... }` | SRX rules only tested in set-format |
-| `ipsec-policies` (block) | `policy NAME { ... }` | SRX rules only tested in set-format |
-| `ipsec-vpns` (block) | `vpn NAME { ... }` | SRX rules only tested in set-format |
-| `community-values` origin: | `origin:AS:tag` | Test uses `target:` only |
-| `tacacs-secrets` (block) | `secret "...";` inside tacplus-server block | Only set-format exercised |
+| *(none)* | — | — |

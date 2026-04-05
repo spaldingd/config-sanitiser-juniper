@@ -677,7 +677,8 @@ class JuniperSanitiser:
 
         if C("ntp-keys"):
             text = S(re.compile(
-                r'^(set\s+system\s+ntp\s+authentication-key\s+\d+\s+\S+\s+value\s+)\S+',
+                r'^(set[^\S\n]+system[^\S\n]+ntp[^\S\n]+authentication-key[^\S\n]+\d+[^\S\n]+'
+                r'(?:\S+[^\S\n]+)+value[^\S\n]+)\S+',
                 re.M), r'\1<REMOVED>', text, "NTP authentication-key value (set)")
 
             text = S(re.compile(
@@ -1005,20 +1006,27 @@ class JuniperSanitiser:
 
         # ── vpn-objects ───────────────────────────────────────────────────
 
+        if C("ike-proposals") or C("ipsec-proposals"):
+            # The block pattern 'proposal NAME {' is shared across IKE and IPsec stanzas.
+            # It fires if either guard is enabled, consistent with set-format behaviour.
+            text = N(re.compile(r'^(\s*proposal\s+)(?P<n>\S+)\s*\{', re.M),
+                         "ike_proposal", "IKE/IPsec proposal def (block)", text)
+
         if C("ike-proposals"):
             text = N(re.compile(
                 r'^(set\s+security\s+ike\s+proposal\s+)(?P<n>\S+)', re.M),
                      "ike_proposal", "IKE proposal def (set)", text)
-            text = N(re.compile(r'^(\s*proposal\s+)(?P<n>\S+)\s*\{', re.M),
-                     "ike_proposal", "IKE/IPsec proposal def (block)", text)
+
+        if C("ike-policies") or C("ipsec-policies"):
+            # The block pattern 'policy NAME {' is shared across IKE and IPsec stanzas.
+            text = N(re.compile(
+                r'^(\s*policy\s+)(?P<n>(?!default\b)\S+)\s*\{', re.M),
+                     "ike_policy", "IKE/IPsec policy def (block)", text)
 
         if C("ike-policies"):
             text = N(re.compile(
                 r'^(set\s+security\s+ike\s+policy\s+)(?P<n>\S+)', re.M),
                      "ike_policy", "IKE policy def (set)", text)
-            text = N(re.compile(
-                r'^(\s*policy\s+)(?P<n>(?!default\b)\S+)\s*\{', re.M),
-                     "ike_policy", "IKE policy def (block)", text)
 
         if C("ike-gateways"):
             text = N(re.compile(
@@ -1041,6 +1049,8 @@ class JuniperSanitiser:
             text = N(re.compile(
                 r'^(set\s+security\s+ipsec\s+vpn\s+)(?P<n>\S+)', re.M),
                      "ipsec_vpn", "IPsec VPN def (set)", text)
+            text = N(re.compile(r'^(\s*vpn\s+)(?P<n>\S+)\s*\{', re.M),
+                     "ipsec_vpn", "IPsec VPN def (block)", text)
 
         # ── cos-objects ───────────────────────────────────────────────────
 
