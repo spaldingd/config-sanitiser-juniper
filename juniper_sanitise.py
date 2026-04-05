@@ -37,25 +37,12 @@ Both config formats produced by Junos are handled:
   curly-brace  (hierarchical block syntax, indented with { } delimiters)
 Many real configs mix both or are exported in one form; the script handles either.
 
-Selectable actions
-──────────────────
-Every sanitisation action belongs to a three-level hierarchy:
-  Group → Pass → Item
-All three levels can be targeted with --skip-* / --only-* flags. Run
-  python juniper_sanitise.py --list-items
-to see the full hierarchy of valid IDs.
-
 Usage
 ─────
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --seed myproject
   python juniper_sanitise.py -i router.conf -o router_clean.conf --dump-map map.json
   python juniper_sanitise.py -i router.conf --dry-run
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --no-ips --no-descriptions
-  python juniper_sanitise.py -i router.conf --skip-group credentials
-  python juniper_sanitise.py -i router.conf --skip-pass routing-auth,vpn-keys
-  python juniper_sanitise.py -i router.conf --skip ntp-keys,ospf-keys
-  python juniper_sanitise.py -i router.conf --only-group named-objects,addressing
-  python juniper_sanitise.py --list-items
 """
 
 import re
@@ -64,275 +51,8 @@ import json
 import hashlib
 import argparse
 import ipaddress
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  HIERARCHY  —  group → pass → (item_id, description)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Each leaf is (item_id, one-line description for --list-items)
-HIERARCHY: dict[str, dict[str, list[tuple[str, str]]]] = {
-    "credentials": {
-        "local-auth": [
-            ("root-password",   "root-authentication encrypted/plain-text password"),
-            ("user-passwords",  "login user encrypted-password and plain-text-password-value"),
-            ("ssh-keys",        "login user ssh-rsa / ssh-dsa / ssh-ecdsa / ssh-ed25519 blobs"),
-        ],
-        "routing-auth": [
-            ("bgp-keys",        "BGP authentication-key (all neighbors and groups)"),
-            ("ospf-keys",       "OSPF MD5 key (set-format and block-format)"),
-            ("isis-keys",       "IS-IS authentication-key (interface and global)"),
-            ("ntp-keys",        "NTP authentication-key value"),
-        ],
-        "aaa-keys": [
-            ("radius-secrets",  "RADIUS server secret (set and block)"),
-            ("tacacs-secrets",  "TACACS+ server secret (set and block)"),
-        ],
-        "vpn-keys": [
-            ("ike-psk",         "IKE pre-shared-key ascii-text / hexadecimal"),
-        ],
-        "snmpv3-keys": [
-            ("snmpv3-passwords", "SNMPv3 authentication-password and privacy-password"),
-        ],
-        "pki": [
-            ("certificate-data", "certificate { } blocks and inline PKI certificate data"),
-        ],
-        "informational": [
-            ("login-banner",    "system login announcement and message"),
-            ("snmp-contact",    "snmp contact free text"),
-            ("snmp-location",   "snmp location free text"),
-        ],
-    },
-    "snmp": {
-        "snmp": [
-            ("snmp-communities", "SNMP community name def and trap-group name (tokenised)"),
-            ("snmp-location",    "snmp location → <REMOVED>  [shared with credentials/informational]"),
-            ("snmp-contact",     "snmp contact  → <REMOVED>  [shared with credentials/informational]"),
-        ],
-    },
-    "bgp-topology": {
-        "as-numbers": [
-            ("bgp-asn",          "routing-options autonomous-system, BGP local-as, peer-as"),
-            ("vrf-rd-rt",        "route-distinguisher and vrf-target AS:tag values"),
-            ("community-values", "target: / origin: / members AS:tag values (inline)"),
-            ("bgp-confederation","confederation identifier and peers"),
-        ],
-    },
-    "named-objects": {
-        "identity": [
-            ("hostname",         "system host-name"),
-            ("domain-name",      "system domain-name and domain-search"),
-            ("usernames",        "system login user NAME"),
-        ],
-        "routing-policy": [
-            ("policy-statements","policy-options policy-statement (def + export/import refs)"),
-            ("firewall-filters", "firewall filter (def + interface input/output refs)"),
-            ("prefix-lists",     "policy-options prefix-list (def + from prefix-list refs)"),
-            ("communities",      "policy-options community (def + from/then community refs)"),
-        ],
-        "bgp-objects": [
-            ("bgp-groups",       "protocols bgp group (def only; neighbor IPs via addressing)"),
-        ],
-        "network-objects": [
-            ("routing-instances","routing-instances NAME — VRF equivalent (def + refs)"),
-            ("security-zones",   "security zones security-zone (def + from-zone/to-zone refs)"),
-            ("address-books",    "security address-book NAME"),
-            ("nat-rulesets",     "security nat source/dest/static rule-set NAME"),
-        ],
-        "aaa-objects": [
-            ("aaa-profiles",     "access profile NAME"),
-        ],
-        "vpn-objects": [
-            ("ike-proposals",    "security ike proposal NAME"),
-            ("ike-policies",     "security ike policy NAME"),
-            ("ike-gateways",     "security ike gateway NAME"),
-            ("ipsec-proposals",  "security ipsec proposal NAME"),
-            ("ipsec-policies",   "security ipsec policy NAME"),
-            ("ipsec-vpns",       "security ipsec vpn NAME"),
-        ],
-        "cos-objects": [
-            ("cos-schedulers",        "class-of-service schedulers NAME"),
-            ("cos-classifiers",       "class-of-service classifiers dscp NAME"),
-            ("cos-forwarding-classes","class-of-service forwarding-classes class NAME"),
-            ("cos-scheduler-maps",    "class-of-service scheduler-maps NAME (def + interface ref)"),
-        ],
-    },
-    "ntp-objects": {
-        "ntp-objects": [
-            ("ntp-key-ids", "system ntp authentication-key N ID (value redacted by ntp-keys)"),
-        ],
-    },
-    "addressing": {
-        "ipv4": [
-            ("ipv4-addresses", "all IPv4 host addresses → IPv4-xxxx tokens"),
-        ],
-        "ipv6": [
-            ("ipv6-addresses", "all IPv6 host addresses → IPv6-xxxx tokens"),
-        ],
-    },
-    "descriptions": {
-        "descriptions": [
-            ("set-descriptions",   "set ... description text  (set-format lines)"),
-            ("block-descriptions", "description text;          (block-format lines)"),
-        ],
-    },
-}
-
-# Derived flat sets used by resolve_config
-ALL_ITEM_IDS: frozenset[str] = frozenset(
-    item_id
-    for passes in HIERARCHY.values()
-    for items in passes.values()
-    for item_id, _ in items
-)
-
-_PASS_TO_ITEMS: dict[str, frozenset[str]] = {
-    pass_name: frozenset(item_id for item_id, _ in items)
-    for passes in HIERARCHY.values()
-    for pass_name, items in passes.items()
-}
-
-_GROUP_TO_ITEMS: dict[str, frozenset[str]] = {
-    group_name: frozenset(
-        item_id
-        for items in passes.values()
-        for item_id, _ in items
-    )
-    for group_name, passes in HIERARCHY.items()
-}
-
-# Item descriptions for --list-items
-_ITEM_DESCRIPTIONS: dict[str, str] = {
-    item_id: desc
-    for passes in HIERARCHY.values()
-    for items in passes.values()
-    for item_id, desc in items
-}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SANITISER CONFIG  —  resolved set of enabled item IDs
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class SanitiserConfig:
-    enabled_items: frozenset[str] = field(
-        default_factory=lambda: frozenset(ALL_ITEM_IDS)
-    )
-
-    def enabled(self, item_id: str) -> bool:
-        return item_id in self.enabled_items
-
-    @classmethod
-    def all_enabled(cls) -> "SanitiserConfig":
-        return cls(enabled_items=frozenset(ALL_ITEM_IDS))
-
-
-def _parse_csv(value: str) -> list[str]:
-    return [v.strip() for v in value.split(",") if v.strip()]
-
-
-def _items_in_group(group: str) -> frozenset[str]:
-    if group not in _GROUP_TO_ITEMS:
-        raise ValueError(
-            f"Unknown group: '{group}'. "
-            f"Valid groups: {', '.join(sorted(_GROUP_TO_ITEMS))}"
-        )
-    return _GROUP_TO_ITEMS[group]
-
-
-def _items_in_pass(pass_name: str) -> frozenset[str]:
-    if pass_name not in _PASS_TO_ITEMS:
-        raise ValueError(
-            f"Unknown pass: '{pass_name}'. "
-            f"Valid passes: {', '.join(sorted(_PASS_TO_ITEMS))}"
-        )
-    return _PASS_TO_ITEMS[pass_name]
-
-
-def resolve_config(args: argparse.Namespace) -> SanitiserConfig:
-    """
-    Apply group → pass → item selection flags in precedence order and return
-    the resolved SanitiserConfig.
-
-    Precedence (lowest → highest):
-      1. Start: all items enabled
-      2. --skip-group  : disable all items in named groups
-      3. --only-group  : disable all items NOT in named groups
-      4. --skip-pass   : disable all items in named passes
-      5. --only-pass   : disable all items NOT in named passes
-      6. --skip        : disable named items individually
-      7. --only        : disable all items not explicitly named
-    """
-    # Mutual exclusion checks at each level
-    if getattr(args, "skip_group", None) and getattr(args, "only_group", None):
-        raise ValueError("--skip-group and --only-group are mutually exclusive.")
-    if getattr(args, "skip_pass", None) and getattr(args, "only_pass", None):
-        raise ValueError("--skip-pass and --only-pass are mutually exclusive.")
-    if getattr(args, "skip", None) and getattr(args, "only", None):
-        raise ValueError("--skip and --only are mutually exclusive.")
-
-    enabled = set(ALL_ITEM_IDS)                         # step 1
-
-    if getattr(args, "skip_group", None):
-        for g in _parse_csv(args.skip_group):
-            enabled -= _items_in_group(g)               # step 2
-
-    if getattr(args, "only_group", None):
-        keep: set[str] = set()
-        for g in _parse_csv(args.only_group):
-            keep |= _items_in_group(g)
-        enabled &= keep                                  # step 3
-
-    if getattr(args, "skip_pass", None):
-        for p in _parse_csv(args.skip_pass):
-            enabled -= _items_in_pass(p)                # step 4
-
-    if getattr(args, "only_pass", None):
-        keep = set()
-        for p in _parse_csv(args.only_pass):
-            keep |= _items_in_pass(p)
-        enabled &= keep                                  # step 5
-
-    if getattr(args, "skip", None):
-        for item in _parse_csv(args.skip):
-            if item not in ALL_ITEM_IDS:
-                raise ValueError(
-                    f"Unknown item: '{item}'. Run --list-items to see valid IDs."
-                )
-            enabled.discard(item)                       # step 6
-
-    if getattr(args, "only", None):
-        keep = set()
-        for item in _parse_csv(args.only):
-            if item not in ALL_ITEM_IDS:
-                raise ValueError(
-                    f"Unknown item: '{item}'. Run --list-items to see valid IDs."
-                )
-            keep.add(item)
-        enabled &= keep                                  # step 7
-
-    # Legacy aliases: --no-ips and --no-descriptions
-    if getattr(args, "no_ips", False):
-        enabled -= _items_in_group("addressing")
-    if getattr(args, "no_descriptions", False):
-        enabled -= _items_in_pass("descriptions")
-
-    return SanitiserConfig(enabled_items=frozenset(enabled))
-
-
-def print_list_items() -> None:
-    """Print the full group → pass → item hierarchy and exit."""
-    print("\n  Selectable sanitisation actions\n")
-    for group_name, passes in HIERARCHY.items():
-        print(f"  GROUP: {group_name}")
-        for pass_name, items in passes.items():
-            print(f"    PASS: {pass_name}")
-            for item_id, desc in items:
-                print(f"      {item_id:<28}  {desc}")
-        print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -340,6 +60,7 @@ def print_list_items() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 RESERVED_KEYWORDS = {
+    # Junos syntax keywords that must never be treated as object names
     "default", "any", "all", "none", "permit", "deny", "in", "out",
     "input", "output", "both", "true", "false", "enable", "disable",
     "active", "inactive", "static", "dynamic", "unicast", "multicast",
@@ -354,7 +75,7 @@ RESERVED_KEYWORDS = {
     "inet-mdt", "inet6-labeled-unicast", "inet-labeled-unicast",
     "inet-mvpn", "inet6-mvpn", "l2vpn-signalling",
     "export", "import", "bgp", "ospf", "ospf3", "isis", "rip", "ripng",
-    "static", "aggregate", "direct", "local", "pim",
+    "aggregate", "direct", "pim",
 }
 
 CATEGORY_PREFIXES = {
@@ -368,7 +89,6 @@ CATEGORY_PREFIXES = {
     "community":          "cmty",
     "snmp_community":     "snmp",
     "bgp_group":          "bgrp",
-    "aaa_server":         "srv",
     "aaa_profile":        "aaa",
     "ike_proposal":       "ikep",
     "ike_policy":         "ikepol",
@@ -390,6 +110,7 @@ CATEGORY_PREFIXES = {
     "ipv6_address":       "IPv6",
 }
 
+# Standard subnet masks (255.x.x.x or 0.x.x.x patterns with only valid mask octets)
 _SUBNET_MASK_RE = re.compile(
     r'\b(?:255|254|252|248|240|224|192|128|0)'
     r'\.(?:255|254|252|248|240|224|192|128|0)'
@@ -401,6 +122,10 @@ _IP_RE = re.compile(
     r'\b((?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
 )
 
+# IPv6 address regex — union of all RFC 5952 compressed forms.
+# Bounded by negative lookbehind/lookahead so it stops at '/' (prefix length),
+# whitespace, and other delimiters.  Each candidate is validated with
+# ipaddress.ip_address() to eliminate false positives (e.g. MAC addresses).
 _IPV6_RE = re.compile(r"""(?<![:\w./])(
     (?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}             |
     (?:[0-9a-fA-F]{1,4}:){1,7}:                           |
@@ -415,24 +140,384 @@ _IPV6_RE = re.compile(r"""(?<![:\w./])(
 )(?![:\w])""", re.X | re.I)
 
 
-def _collect_skip_spans_v4(text: str) -> set[tuple[int, int]]:
+def _collect_skip_spans(text: str) -> set[tuple[int, int]]:
+    """Return spans of all IP-like values that must NOT be anonymised."""
     skip: set[tuple[int, int]] = set()
+
+    # Standard subnet masks (well-formed mask octets only)
+    # Junos uses CIDR prefix notation rather than wildcard masks, so only
+    # subnet masks need to be excluded here (no ACE wildcard or network
+    # statement handling required).
     for m in _SUBNET_MASK_RE.finditer(text):
         skip.add(m.span())
+
     return skip
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TOKEN GENERATOR
+#  SANITISER CONFIGURATION  —  item / pass / group selection
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Hierarchy definition ──────────────────────────────────────────────────────
+#
+# Three-level tree: GROUP → PASS → ITEM
+# Items are the atomic units checked inside pass methods via cfg.enabled(item).
+# Passes are named collections of items.
+# Groups are named collections of passes.
+#
+# Key:  group_id  →  { pass_id  →  [item_id, ...] }
+
+SANITISE_HIERARCHY: dict[str, dict[str, list[str]]] = {
+    "credentials": {
+        "local-auth": [
+            "root-password",
+            "user-passwords",
+            "ssh-keys",
+        ],
+        "routing-auth": [
+            "bgp-keys",
+            "ospf-keys",
+            "isis-keys",
+            "ntp-keys",
+        ],
+        "aaa-keys": [
+            "radius-secrets",
+            "tacacs-secrets",
+        ],
+        "vpn-keys": [
+            "ike-psk",
+        ],
+        "snmpv3-keys": [
+            "snmpv3-passwords",
+        ],
+        "pki": [
+            "certificate-data",
+        ],
+        "informational": [
+            "login-banner",
+            "snmp-contact",
+            "snmp-location",
+        ],
+    },
+    "snmp": {
+        "snmp": [
+            "snmp-communities",
+            "snmp-location",
+            "snmp-contact",
+        ],
+    },
+    "bgp-topology": {
+        "as-numbers": [
+            "bgp-asn",
+            "vrf-rd-rt",
+            "community-values",
+            "bgp-confederation",
+        ],
+    },
+    "named-objects": {
+        "identity": [
+            "hostname",
+            "domain-name",
+            "usernames",
+        ],
+        "routing-policy": [
+            "policy-statements",
+            "firewall-filters",
+            "prefix-lists",
+            "communities",
+        ],
+        "bgp-objects": [
+            "bgp-groups",
+        ],
+        "network-objects": [
+            "routing-instances",
+            "security-zones",
+            "address-books",
+            "nat-rulesets",
+        ],
+        "aaa-objects": [
+            "aaa-profiles",
+        ],
+        "vpn-objects": [
+            "ike-proposals",
+            "ike-policies",
+            "ike-gateways",
+            "ipsec-proposals",
+            "ipsec-policies",
+            "ipsec-vpns",
+        ],
+        "cos-objects": [
+            "cos-schedulers",
+            "cos-classifiers",
+            "cos-forwarding-classes",
+            "cos-scheduler-maps",
+        ],
+    },
+    "ntp-objects": {
+        "ntp-objects": [
+            "ntp-key-ids",
+        ],
+    },
+    "addressing": {
+        "ipv4": [
+            "ipv4-addresses",
+        ],
+        "ipv6": [
+            "ipv6-addresses",
+        ],
+    },
+    "descriptions": {
+        "descriptions": [
+            "set-descriptions",
+            "block-descriptions",
+        ],
+    },
+}
+
+# Convenience flat lookups built once at import time
+_ALL_ITEMS:  frozenset[str] = frozenset(
+    item
+    for passes in SANITISE_HIERARCHY.values()
+    for items in passes.values()
+    for item in items
+)
+_ALL_PASSES: frozenset[str] = frozenset(
+    pass_id
+    for passes in SANITISE_HIERARCHY.values()
+    for pass_id in passes
+)
+_ALL_GROUPS: frozenset[str] = frozenset(SANITISE_HIERARCHY)
+
+# Maps pass_id → frozenset of item_ids within it
+_PASS_TO_ITEMS: dict[str, frozenset[str]] = {
+    pass_id: frozenset(items)
+    for passes in SANITISE_HIERARCHY.values()
+    for pass_id, items in passes.items()
+}
+
+# Maps group_id → frozenset of item_ids within it
+_GROUP_TO_ITEMS: dict[str, frozenset[str]] = {
+    group_id: frozenset(
+        item
+        for pass_items in passes.values()
+        for item in pass_items
+    )
+    for group_id, passes in SANITISE_HIERARCHY.items()
+}
+
+# Maps item_id → (group_id, pass_id) for membership queries
+_ITEM_TO_PATH: dict[str, tuple[str, str]] = {
+    item: (group_id, pass_id)
+    for group_id, passes in SANITISE_HIERARCHY.items()
+    for pass_id, items in passes.items()
+    for item in items
+}
+
+
+class SanitiserConfig:
+    """
+    Resolves CLI selection flags into a frozenset of enabled item IDs.
+
+    Precedence (highest wins):  item  >  pass  >  group
+
+    Resolution order applied to the full item set:
+      1. Start with all items enabled
+      2. Apply --skip-group  (disable all items in named groups)
+      3. Apply --only-group  (disable items NOT in named groups)
+      4. Apply --skip-pass   (disable all items in named passes)
+      5. Apply --only-pass   (disable items NOT in named passes)
+      6. Apply --skip        (disable named items individually)
+      7. Apply --only        (disable all items not explicitly named)
+
+    --skip and --only are mutually exclusive at each level.
+    """
+
+    def __init__(
+        self,
+        skip_groups:  list[str] | None = None,
+        only_groups:  list[str] | None = None,
+        skip_passes:  list[str] | None = None,
+        only_passes:  list[str] | None = None,
+        skip_items:   list[str] | None = None,
+        only_items:   list[str] | None = None,
+    ) -> None:
+        enabled = set(_ALL_ITEMS)
+
+        for g in (skip_groups or []):        # step 2
+            enabled -= _GROUP_TO_ITEMS.get(g, frozenset())
+
+        if only_groups:                      # step 3
+            keep = frozenset().union(*(_GROUP_TO_ITEMS.get(g, frozenset())
+                                       for g in only_groups))
+            enabled &= keep
+
+        for p in (skip_passes or []):        # step 4
+            enabled -= _PASS_TO_ITEMS.get(p, frozenset())
+
+        if only_passes:                      # step 5
+            keep = frozenset().union(*(_PASS_TO_ITEMS.get(p, frozenset())
+                                       for p in only_passes))
+            enabled &= keep
+
+        for i in (skip_items or []):         # step 6
+            enabled.discard(i)
+
+        if only_items:                       # step 7
+            enabled &= frozenset(only_items)
+
+        self._enabled: frozenset[str] = frozenset(enabled)
+
+    # ── Querying ──────────────────────────────────────────────────────────
+
+    def enabled(self, item_id: str) -> bool:
+        """Return True if the named item is active."""
+        return item_id in self._enabled
+
+    def pass_has_any(self, pass_id: str) -> bool:
+        """Return True if at least one item in the pass is enabled."""
+        return bool(_PASS_TO_ITEMS.get(pass_id, frozenset()) & self._enabled)
+
+    def group_has_any(self, group_id: str) -> bool:
+        """Return True if at least one item in the group is enabled."""
+        return bool(_GROUP_TO_ITEMS.get(group_id, frozenset()) & self._enabled)
+
+    # ── Introspection (used by banner and startup summary) ────────────────
+
+    def disabled_items(self) -> frozenset[str]:
+        return _ALL_ITEMS - self._enabled
+
+    def disabled_passes(self) -> frozenset[str]:
+        """Passes where ALL items are disabled."""
+        return frozenset(
+            p for p in _ALL_PASSES
+            if not (_PASS_TO_ITEMS[p] & self._enabled)
+        )
+
+    def disabled_groups(self) -> frozenset[str]:
+        """Groups where ALL items are disabled."""
+        return frozenset(
+            g for g in _ALL_GROUPS
+            if not (_GROUP_TO_ITEMS[g] & self._enabled)
+        )
+
+    def summary_lines(self) -> list[str]:
+        """
+        Human-readable summary of what is disabled, used in the startup
+        header. Reports at the coarsest granularity possible: whole groups
+        first, then whole passes, then individual items.
+        """
+        lines = []
+        reported_items: set[str] = set()
+
+        for g in sorted(self.disabled_groups()):
+            lines.append(f"  Skipped group  : {g}")
+            reported_items |= _GROUP_TO_ITEMS[g]
+
+        for p in sorted(self.disabled_passes()):
+            if _PASS_TO_ITEMS[p] <= reported_items:
+                continue   # already covered by a group
+            lines.append(f"  Skipped pass   : {p}")
+            reported_items |= _PASS_TO_ITEMS[p]
+
+        for i in sorted(self.disabled_items()):
+            if i not in reported_items:
+                lines.append(f"  Skipped item   : {i}")
+
+        return lines
+
+    # ── Validation ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def validate(
+        skip_groups:  list[str],
+        only_groups:  list[str],
+        skip_passes:  list[str],
+        only_passes:  list[str],
+        skip_items:   list[str],
+        only_items:   list[str],
+    ) -> list[str]:
+        """Return a list of error strings (empty = valid)."""
+        errors: list[str] = []
+        for name in skip_groups + only_groups:
+            if name not in _ALL_GROUPS:
+                errors.append(
+                    f"Unknown group '{name}'. "
+                    f"Valid: {', '.join(sorted(_ALL_GROUPS))}")
+        for name in skip_passes + only_passes:
+            if name not in _ALL_PASSES:
+                errors.append(
+                    f"Unknown pass '{name}'. "
+                    f"Valid: {', '.join(sorted(_ALL_PASSES))}")
+        for name in skip_items + only_items:
+            if name not in _ALL_ITEMS:
+                errors.append(
+                    f"Unknown item '{name}'. "
+                    f"Valid: {', '.join(sorted(_ALL_ITEMS))}")
+        if skip_groups and only_groups:
+            errors.append("--skip-group and --only-group cannot be combined.")
+        if skip_passes and only_passes:
+            errors.append("--skip-pass and --only-pass cannot be combined.")
+        if skip_items and only_items:
+            errors.append("--skip and --only cannot be combined.")
+        return errors
+
+    @classmethod
+    def default(cls) -> "SanitiserConfig":
+        """All items enabled — equivalent to running with no selection flags."""
+        return cls()
+
+    @classmethod
+    def from_args(cls, args: "argparse.Namespace") -> "SanitiserConfig":
+        """
+        Construct from parsed CLI args, handling legacy flag aliases.
+        --no-ips          →  --skip-group addressing
+        --no-descriptions →  --skip-pass  descriptions
+        """
+        skip_groups = list(args.skip_group)
+        only_groups = list(args.only_group)
+        skip_passes = list(args.skip_pass)
+        only_passes = list(args.only_pass)
+        skip_items  = list(args.skip)
+        only_items  = list(args.only)
+
+        if getattr(args, "no_ips", False):
+            skip_groups.append("addressing")
+        if getattr(args, "no_descriptions", False):
+            skip_passes.append("descriptions")
+
+        errors = cls.validate(
+            skip_groups, only_groups,
+            skip_passes, only_passes,
+            skip_items,  only_items,
+        )
+        if errors:
+            for e in errors:
+                print(f"  ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        return cls(
+            skip_groups=skip_groups,
+            only_groups=only_groups,
+            skip_passes=skip_passes,
+            only_passes=only_passes,
+            skip_items=skip_items,
+            only_items=only_items,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOKEN GENERATOR  —  deterministic, collision-safe, double-anonymisation-safe
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TokenGenerator:
     def __init__(self, seed: str = "juniper-sanitise"):
         self.seed = seed
         self._maps: dict[str, dict[str, str]] = {}
+        # Reverse maps: category → set of output tokens (for already_token check)
         self._reverse: dict[str, set[str]] = {}
 
     def get(self, category: str, original: str) -> str:
+        """Return a stable anonymised token for (category, original)."""
         cat_map = self._maps.setdefault(category, {})
         rev_set = self._reverse.setdefault(category, set())
         if original in cat_map:
@@ -451,6 +536,7 @@ class TokenGenerator:
         return token
 
     def already_token(self, category: str, value: str) -> bool:
+        """True if value is already an output token for this category."""
         return value in self._reverse.get(category, set())
 
     def all_mappings(self) -> dict[str, dict[str, str]]:
@@ -461,16 +547,20 @@ class TokenGenerator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  IP ANONYMISER
+#  IP ANONYMISER  —  IPv4-xxxx / IPv6-xxxx token scheme, masks/CIDR preserved
 # ══════════════════════════════════════════════════════════════════════════════
 
 class IPAnonymiser:
+    # IPv4 addresses always kept verbatim
     PRESERVE_V4 = {"0.0.0.0", "255.255.255.255", "127.0.0.1"}
 
     def __init__(self, tokens: TokenGenerator):
         self.tokens = tokens
 
+    # ── IPv4 ──────────────────────────────────────────────────────────────────
+
     def _anon_v4(self, original: str) -> str:
+        """Return consistent IPv4-xxxx token for a host address."""
         try:
             addr = ipaddress.ip_address(original)
         except ValueError:
@@ -480,7 +570,9 @@ class IPAnonymiser:
         return self.tokens.get("ip_address", original)
 
     def anonymise(self, text: str) -> str:
-        skip_spans = _collect_skip_spans_v4(text)
+        """Replace IPv4 host addresses with IPv4-xxxx tokens; leave masks and CIDR alone."""
+        skip_spans = _collect_skip_spans(text)
+
         ip_re = re.compile(
             r'\b((?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}'
             r'(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
@@ -497,17 +589,28 @@ class IPAnonymiser:
         parts.append(text[prev:])
         return "".join(parts)
 
+    # ── IPv6 ──────────────────────────────────────────────────────────────────
+
     def _anon_v6(self, original: str) -> str:
+        """Return consistent IPv6-xxxx token for a host address."""
         try:
             addr = ipaddress.ip_address(original)
         except ValueError:
             return original
+        # Preserve protocol-reserved addresses — carry no topology information
         if (addr.is_loopback or addr.is_unspecified
                 or addr.is_link_local or addr.is_multicast):
             return original
         return self.tokens.get("ipv6_address", original)
 
     def anonymise_v6(self, text: str) -> str:
+        """Replace IPv6 host addresses with IPv6-xxxx tokens.
+
+        Junos uses CIDR notation exclusively — there are no separate wildcard
+        address fields — so no skip-span logic is needed beyond the negative
+        lookbehind on '/' in _IPV6_RE.  Each regex candidate is validated with
+        ipaddress.ip_address() to eliminate false positives such as MAC addresses.
+        """
         parts: list[str] = []
         prev = 0
         for m in _IPV6_RE.finditer(text):
@@ -525,26 +628,14 @@ class IPAnonymiser:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class JuniperSanitiser:
-    def __init__(self,
-                 seed: str = "juniper-sanitise",
-                 cfg: "SanitiserConfig | None" = None,
-                 # Legacy keyword aliases — retained for backward compatibility
-                 anonymise_ips: bool = True,
-                 anonymise_descriptions: bool = True):
+    def __init__(self, seed: str = "juniper-sanitise",
+                 cfg: SanitiserConfig | None = None):
         self.tokens = TokenGenerator(seed=seed)
-        # If a SanitiserConfig is provided it takes precedence; otherwise
-        # translate legacy boolean flags into an equivalent config.
-        if cfg is not None:
-            self.cfg = cfg
-        else:
-            enabled = set(ALL_ITEM_IDS)
-            if not anonymise_ips:
-                enabled -= _items_in_group("addressing")
-            if not anonymise_descriptions:
-                enabled -= _items_in_pass("descriptions")
-            self.cfg = SanitiserConfig(enabled_items=frozenset(enabled))
-
-        self.ip_anon = IPAnonymiser(self.tokens)
+        self._cfg   = cfg if cfg is not None else SanitiserConfig.default()
+        self.ip_anon = (
+            IPAnonymiser(self.tokens)
+            if self._cfg.group_has_any("addressing") else None
+        )
         self._log: list[str] = []
 
     # ─────────────────────────────────────────── public ──────────────────
@@ -552,16 +643,21 @@ class JuniperSanitiser:
     def process(self, text: str) -> str:
         self._log = []
         text = self._pass_credentials(text)
-        text = self._pass_snmp(text)
-        text = self._pass_as_numbers(text)
-        text = self._pass_named_objects(text)
-        text = self._pass_descriptions(text)
-        if self.cfg.enabled("ipv4-addresses"):
-            text = self.ip_anon.anonymise(text)
-            self._log.append("  [IP]  IPv4 host addresses anonymised")
-        if self.cfg.enabled("ipv6-addresses"):
-            text = self.ip_anon.anonymise_v6(text)
-            self._log.append("  [IP]  IPv6 host addresses anonymised")
+        if self._cfg.pass_has_any("snmp"):
+            text = self._pass_snmp(text)
+        if self._cfg.pass_has_any("as-numbers"):
+            text = self._pass_as_numbers(text)
+        if self._cfg.group_has_any("named-objects") or self._cfg.group_has_any("ntp-objects"):
+            text = self._pass_named_objects(text)
+        if self._cfg.pass_has_any("descriptions"):
+            text = self._pass_descriptions(text)
+        if self.ip_anon:
+            if self._cfg.enabled("ipv4-addresses"):
+                text = self.ip_anon.anonymise(text)
+                self._log.append("  [IP]  IPv4 host addresses anonymised")
+            if self._cfg.enabled("ipv6-addresses"):
+                text = self.ip_anon.anonymise_v6(text)
+                self._log.append("  [IP]  IPv6 host addresses anonymised")
         return text
 
     @property
@@ -577,13 +673,15 @@ class JuniperSanitiser:
         return result
 
     def _name(self, category: str, original: str) -> str:
+        """Return token; pass through reserved keywords and existing tokens."""
         if original.lower() in RESERVED_KEYWORDS:
             return original
         if self.tokens.already_token(category, original):
-            return original
+            return original   # prevents double-anonymisation
         return self.tokens.get(category, original)
 
     def _repl(self, m: re.Match, category: str) -> str:
+        """Generic replacement handler for patterns with named group 'n'."""
         original = m.group("n")
         token = self._name(category, original)
         s = m.start("n") - m.start()
@@ -603,7 +701,7 @@ class JuniperSanitiser:
 
     def _pass_credentials(self, text: str) -> str:
         S = self._sub
-        C = self.cfg.enabled
+        C = self._cfg.enabled
 
         # ── local-auth ────────────────────────────────────────────────────
 
@@ -751,7 +849,7 @@ class JuniperSanitiser:
 
     def _pass_snmp(self, text: str) -> str:
         N = self._sub_name
-        C = self.cfg.enabled
+        C = self._cfg.enabled
 
         if C("snmp-communities"):
             text = N(re.compile(r'^(set\s+snmp\s+community\s+)(?P<n>\S+)', re.M),
@@ -774,7 +872,7 @@ class JuniperSanitiser:
     # ──────────────────────────────── pass 3: AS numbers ─────────────────
 
     def _pass_as_numbers(self, text: str) -> str:
-        C = self.cfg.enabled
+        C = self._cfg.enabled
 
         def replace_as(m: re.Match) -> str:
             return m.group(1) + self.tokens.get("as_number", m.group(2))
@@ -871,7 +969,7 @@ class JuniperSanitiser:
 
     def _pass_named_objects(self, text: str) -> str:
         N = self._sub_name
-        C = self.cfg.enabled
+        C = self._cfg.enabled
 
         # ── identity ──────────────────────────────────────────────────────
 
@@ -1095,7 +1193,7 @@ class JuniperSanitiser:
     # ──────────────────────────────── pass 5: descriptions ───────────────
 
     def _pass_descriptions(self, text: str) -> str:
-        C = self.cfg.enabled
+        cfg = self._cfg
 
         def repl(m: re.Match) -> str:
             prefix = m.group(1)
@@ -1104,16 +1202,21 @@ class JuniperSanitiser:
                 return m.group(0)
             return prefix + self.tokens.get("description", desc)
 
-        if C("set-descriptions"):
+        if cfg.enabled("set-descriptions"):
             text = self._sub(
                 re.compile(r'^(set\s+.*?\s+description\s+)(.+)$', re.M),
                 repl, text, "set-format description lines")
 
-        if C("block-descriptions"):
+        if cfg.enabled("block-descriptions"):
+            def repl_block(m: re.Match) -> str:
+                prefix = m.group(1)
+                desc = m.group(2)
+                if self.tokens.already_token("description", desc):
+                    return m.group(0)
+                return prefix + self.tokens.get("description", desc) + ";"
             text = self._sub(
                 re.compile(r'^(\s*description\s+)(.+?)\s*;$', re.M),
-                lambda m: repl(m) + ';' if not repl(m).endswith(';') else repl(m),
-                text, "block-format description lines")
+                repl_block, text, "block-format description lines")
 
         return text
 
@@ -1144,105 +1247,186 @@ def parse_args() -> argparse.Namespace:
         description="Sanitise Juniper Junos configuration files (set-format and curly-brace).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Selection flags (all accept comma-separated lists):
-  --skip-group   credentials,snmp     skip entire groups
-  --only-group   named-objects        run only these groups
-  --skip-pass    routing-auth,pki     skip specific passes
-  --only-pass    identity,bgp-objects run only these passes
-  --skip         ntp-keys,ospf-keys   skip specific items
-  --only         hostname,bgp-keys    run only these items
+Selection flags (can be combined; item > pass > group precedence):
+  --skip-group credentials      skip the entire credentials group
+  --only-group named-objects    run only the named-objects group
+  --skip-pass  vpn-keys         skip the vpn-keys pass
+  --only-pass  routing-auth     run only the routing-auth pass
+  --skip       login-banner,ntp-keys  skip specific items
+  --only       hostname,ipv4-addresses  run only these items
 
-Run --list-items to see all valid group, pass, and item IDs.
+Available groups : credentials, snmp, bgp-topology, named-objects,
+                   ntp-objects, addressing, descriptions
+Available passes : local-auth, routing-auth, aaa-keys, vpn-keys, snmpv3-keys,
+                   pki, informational, snmp, as-numbers, identity,
+                   routing-policy, bgp-objects, network-objects, aaa-objects,
+                   vpn-objects, cos-objects, ntp-objects, ipv4, ipv6,
+                   descriptions
+Run with --list-items to see all available item IDs.
 
-Precedence (lowest → highest): group → pass → item.
---skip and --only are mutually exclusive at the same level.
+Legacy flags (still supported):
+  --no-ips          equivalent to --skip-group addressing
+  --no-descriptions equivalent to --skip-pass  descriptions
 
 Examples:
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --seed myproject
-  python juniper_sanitise.py -i router.conf -o router_clean.conf --dump-map map.json
   python juniper_sanitise.py -i router.conf --dry-run
-  python juniper_sanitise.py -i ./configs/ -o ./clean/ --no-ips --no-descriptions
-  python juniper_sanitise.py -i router.conf --skip-group credentials
-  python juniper_sanitise.py -i router.conf --only-group named-objects,addressing
-  python juniper_sanitise.py -i router.conf --skip ntp-keys,login-banner
-  python juniper_sanitise.py --list-items
+  python juniper_sanitise.py -i router.conf --skip-group addressing,descriptions
+  python juniper_sanitise.py -i router.conf --only-group credentials,snmp
+  python juniper_sanitise.py -i router.conf --skip login-banner,ntp-keys
         """
     )
-    p.add_argument("-i", "--input",      required=False,
+    p.add_argument("-i", "--input",       required=False,
                    help="Input file or directory")
-    p.add_argument("-o", "--output",     required=False,
+    p.add_argument("-o", "--output",      required=False,
                    help="Output file or directory")
-    p.add_argument("--seed",             default="juniper-sanitise",
+    p.add_argument("--seed",              default="juniper-sanitise",
                    help="Determinism seed — same seed = same tokens every run")
-
-    # ── Legacy flags (retained as aliases) ───────────────────────────────
-    p.add_argument("--no-ips",           action="store_true",
-                   help="Skip IP address anonymisation (alias for --skip-group addressing)")
-    p.add_argument("--no-descriptions",  action="store_true",
-                   help="Skip description anonymisation (alias for --skip-pass descriptions)")
-
-    # ── Selection flags ───────────────────────────────────────────────────
-    p.add_argument("--skip-group",       metavar="GROUPS",
-                   help="Comma-separated groups to skip")
-    p.add_argument("--only-group",       metavar="GROUPS",
-                   help="Comma-separated groups to run (all others skipped)")
-    p.add_argument("--skip-pass",        metavar="PASSES",
-                   help="Comma-separated passes to skip")
-    p.add_argument("--only-pass",        metavar="PASSES",
-                   help="Comma-separated passes to run (all others skipped)")
-    p.add_argument("--skip",             metavar="ITEMS",
-                   help="Comma-separated items to skip")
-    p.add_argument("--only",             metavar="ITEMS",
-                   help="Comma-separated items to run (all others skipped)")
-
-    # ── Utility ───────────────────────────────────────────────────────────
-    p.add_argument("--list-items",       action="store_true",
-                   help="Print all valid group/pass/item IDs and exit")
-    p.add_argument("--dump-map",         metavar="FILE",
+    p.add_argument("--dump-map",          metavar="FILE",
                    help="Write full original→token mapping to a JSON file")
-    p.add_argument("--dry-run",          action="store_true",
+    p.add_argument("--dry-run",           action="store_true",
                    help="Print sanitised output to stdout; do not write files")
-    p.add_argument("--extensions",       default=".conf,.txt,.cfg,.log",
-                   help="Comma-separated file extensions to process")
-    return p.parse_args()
+    p.add_argument("--extensions",        default=".conf,.txt,.cfg,.log",
+                   help="Comma-separated file extensions to process when input is a directory")
+    p.add_argument("--list-items",        action="store_true",
+                   help="Print all valid group / pass / item IDs and exit")
+
+    # Selection flags
+    sel = p.add_argument_group("selection (group level)")
+    sel.add_argument("--skip-group", metavar="GROUP[,GROUP...]", default="",
+                     help="Disable all items in the named group(s)")
+    sel.add_argument("--only-group", metavar="GROUP[,GROUP...]", default="",
+                     help="Enable only the named group(s); disable everything else")
+
+    sel2 = p.add_argument_group("selection (pass level)")
+    sel2.add_argument("--skip-pass", metavar="PASS[,PASS...]", default="",
+                      help="Disable all items in the named pass(es)")
+    sel2.add_argument("--only-pass", metavar="PASS[,PASS...]", default="",
+                      help="Enable only the named pass(es); disable everything else")
+
+    sel3 = p.add_argument_group("selection (item level)")
+    sel3.add_argument("--skip", metavar="ITEM[,ITEM...]", default="",
+                      help="Disable the named item(s)")
+    sel3.add_argument("--only", metavar="ITEM[,ITEM...]", default="",
+                      help="Enable only the named item(s); disable everything else")
+
+    # Legacy aliases (kept for backward compatibility)
+    leg = p.add_argument_group("legacy flags (deprecated aliases)")
+    leg.add_argument("--no-ips",          action="store_true",
+                     help="Skip IP address anonymisation (alias: --skip-group addressing)")
+    leg.add_argument("--no-descriptions", action="store_true",
+                     help="Skip description anonymisation (alias: --skip-pass descriptions)")
+
+    args = p.parse_args()
+
+    # --list-items: print hierarchy and exit
+    if args.list_items:
+        print("\nAvailable groups, passes, and items:\n")
+        for group_id, passes in SANITISE_HIERARCHY.items():
+            print(f"  GROUP: {group_id}")
+            for pass_id, items in passes.items():
+                print(f"    PASS: {pass_id}")
+                for item in items:
+                    print(f"      item: {item}")
+        print()
+        sys.exit(0)
+
+    if not args.input:
+        p.error("the following arguments are required: -i/--input")
+
+    # Normalise comma-separated values to lists
+    def _split(s: str) -> list[str]:
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    args.skip_group = _split(args.skip_group)
+    args.only_group = _split(args.only_group)
+    args.skip_pass  = _split(args.skip_pass)
+    args.only_pass  = _split(args.only_pass)
+    args.skip       = _split(args.skip)
+    args.only       = _split(args.only)
+
+    return args
 
 
-def _active_config_summary(cfg: SanitiserConfig) -> str:
-    """Return a compact human-readable summary of what is enabled/disabled."""
-    disabled_groups = [
-        g for g, items in _GROUP_TO_ITEMS.items()
-        if not items.intersection(cfg.enabled_items)
+# Repository URL — update this when the project is published.
+# This value is embedded in the sanitised-configuration banner.
+REPO_URL = "https://github.com/YOUR-ORG/YOUR-REPO"
+
+
+def _seed_fingerprint(seed: str) -> str:
+    """
+    Return a 16-character hex fingerprint of the seed (first 64 bits of
+    SHA-256). This is published in the sanitised-output banner so that two
+    files can be verified as sharing the same seed (and therefore having
+    consistent tokens) without exposing the seed itself.
+
+    The seed is intentionally kept secret because, combined with the script,
+    it enables forward-lookup against guessable values — most critically,
+    IP addresses, where exhaustive enumeration of RFC 1918 space is trivial.
+    A fingerprint preserves the diff-ability use-case while eliminating that
+    risk.
+    """
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+def _sanitised_banner(seed: str, cfg: SanitiserConfig) -> str:
+    """
+    Return a comment block to prepend to every sanitised output file.
+    Uses '#' as the comment character, which is valid on Junos.
+    The action list is derived from SanitiserConfig so it accurately reflects
+    what was actually run.
+    The seed fingerprint (not the seed itself) is included so that two sanitised
+    files can be confirmed as sharing the same seed without exposing it.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    fingerprint = _seed_fingerprint(seed)
+
+    # Build action lines at the most specific accurate level.
+    # Each entry is (condition, label).
+    action_map = [
+        (cfg.group_has_any("credentials"),
+         "credentials and keys replaced with <REMOVED>"),
+        (cfg.group_has_any("snmp"),
+         "SNMP communities, location, and contact sanitised"),
+        (cfg.group_has_any("bgp-topology"),
+         "BGP AS numbers and community values replaced with opaque tokens"),
+        (cfg.group_has_any("named-objects"),
+         "named objects (hostnames, routing-instances, firewall filters, etc.) replaced with"
+         " opaque tokens"),
+        (cfg.group_has_any("addressing"),
+         "IP addresses (IPv4 and IPv6) replaced with opaque tokens"),
+        (cfg.pass_has_any("descriptions"),
+         "description text replaced with opaque tokens"),
     ]
-    partial_groups = [
-        g for g, items in _GROUP_TO_ITEMS.items()
-        if items.intersection(cfg.enabled_items) and not items.issubset(cfg.enabled_items)
+    actions = [label for condition, label in action_map if condition]
+
+    # Note any entirely-skipped groups so the reader knows what was NOT done
+    skipped = sorted(cfg.disabled_groups())
+
+    sep = "#" + "=" * 69
+    out_lines = [
+        sep,
+        "# SANITISED CONFIGURATION",
+        "# This file has been processed by juniper_sanitise.py.",
+        "# Original sensitive data has been replaced as follows:",
+        "#",
     ]
-    if not disabled_groups and not partial_groups:
-        return "All actions enabled (default)"
-    parts = []
-    if disabled_groups:
-        parts.append(f"Groups skipped: {', '.join(disabled_groups)}")
-    if partial_groups:
-        # Show which passes are fully disabled within partial groups
-        skipped_passes = [
-            p for p, items in _PASS_TO_ITEMS.items()
-            if not items.intersection(cfg.enabled_items)
-        ]
-        if skipped_passes:
-            parts.append(f"Passes skipped: {', '.join(skipped_passes)}")
-        # Show individual disabled items not covered by a fully-skipped pass
-        skipped_pass_items = frozenset(
-            item
-            for p in skipped_passes
-            for item in _PASS_TO_ITEMS[p]
-        )
-        lone_disabled = [
-            i for i in ALL_ITEM_IDS
-            if i not in cfg.enabled_items and i not in skipped_pass_items
-        ]
-        if lone_disabled:
-            parts.append(f"Items skipped: {', '.join(sorted(lone_disabled))}")
-    return "  /  ".join(parts)
+    for action in actions:
+        out_lines.append(f"#   - {action}")
+    if skipped:
+        out_lines.append("#")
+        out_lines.append("# The following sanitisation groups were skipped:")
+        for g in skipped:
+            out_lines.append(f"#   - {g}")
+    out_lines += [
+        "#",
+        f"# Sanitised   : {now}",
+        f"# Seed hash   : {fingerprint}  (SHA-256 fingerprint — not the seed itself)",
+        f"# Script      : {REPO_URL}",
+        sep,
+        "",
+    ]
+    return "\n".join(out_lines) + "\n"
 
 
 def process_file(path: Path, dest: "Path | None",
@@ -1256,6 +1440,7 @@ def process_file(path: Path, dest: "Path | None",
         return False
 
     result = sanitiser.process(text)
+    result = _sanitised_banner(sanitiser.tokens.seed, sanitiser._cfg) + result
     for entry in sanitiser.log:
         print(entry)
 
@@ -1272,23 +1457,8 @@ def process_file(path: Path, dest: "Path | None",
 
 def main() -> None:
     args = parse_args()
-
-    if args.list_items:
-        print_list_items()
-        sys.exit(0)
-
-    if not args.input:
-        print("ERROR: -i / --input is required unless using --list-items.")
-        sys.exit(1)
-
-    try:
-        cfg = resolve_config(args)
-    except ValueError as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
-
+    cfg = SanitiserConfig.from_args(args)
     sanitiser = JuniperSanitiser(seed=args.seed, cfg=cfg)
-
     exts = tuple(e if e.startswith(".") else f".{e}"
                  for e in args.extensions.split(","))
     inp = Path(args.input)
@@ -1298,9 +1468,12 @@ def main() -> None:
     print("║       Juniper Configuration Sanitiser                   ║")
     print("║  Junos  ·  set-format  ·  curly-brace format            ║")
     print("╚══════════════════════════════════════════════════════════╝")
-    print(f"  Seed            : {args.seed}")
-    print(f"  Active config   : {_active_config_summary(cfg)}")
-    print(f"  Dry run         : {'Yes' if args.dry_run else 'No'}")
+    print(f"  Seed     : {args.seed}")
+    print(f"  Dry run  : {'Yes' if args.dry_run else 'No'}")
+    for line in cfg.summary_lines():
+        print(line)
+    if not cfg.summary_lines():
+        print("  Selection: all items enabled (default)")
 
     success = failure = 0
 
