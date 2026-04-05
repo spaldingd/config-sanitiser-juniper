@@ -6,8 +6,7 @@ credentials, internal addressing, or network topology.
 
 Both Junos config formats are supported: **set-format** (one statement per line)
 and **curly-brace / hierarchical** format. Real-world configs in either form, or
-mixed, are handled correctly. Every credential and named-object rule has dual
-patterns covering both formats.
+mixed, are handled correctly.
 
 ---
 
@@ -30,8 +29,8 @@ patterns covering both formats.
   confederation, `route-distinguisher`, `vrf-target` / `target:` community values,
   and `origin:` community values all replaced with consistent `AS-xxxx` tokens
 - **SNMP community strings tokenised** — not just redacted, so `community` definitions
-  and `trap-group` references carry the same `snmp-xxxx` token; `snmp-server location`
-  and `snmp-server contact` are redacted
+  and `trap-group` references carry the same `snmp-xxxx` token; `snmp location` and
+  `snmp contact` are redacted
 - **Login announcement and message redacted** — `announcement` and `message` fields
   under `system login` replaced with `<REMOVED>` while preserving config structure
 - **Named objects tokenised** — hostnames, usernames, domain names, routing-instances
@@ -42,6 +41,9 @@ patterns covering both formats.
 - **Descriptions anonymised** — all `description` text replaced with `desc-xxxx`
   tokens, covering both set-format inline descriptions and block-format
   `description "...";` lines
+- **Selectable actions** — every sanitisation action belongs to a three-level
+  group → pass → item hierarchy; any level can be targeted with `--skip-*` /
+  `--only-*` flags for full granular control
 - **Deterministic** — the same seed always produces the same tokens, so outputs are
   reproducible and comparable across runs
 - **Traceable** — every substitution is recorded; an optional JSON mapping file maps
@@ -58,7 +60,7 @@ patterns covering both formats.
 
 - Python 3.10 or later
 - No third-party dependencies — standard library only (`re`, `hashlib`, `argparse`,
-  `ipaddress`, `json`, `pathlib`)
+  `ipaddress`, `json`, `pathlib`, `dataclasses`)
 
 ---
 
@@ -68,8 +70,7 @@ No installation required. Copy `juniper_sanitise.py` to any convenient location 
 run it directly with Python.
 
 ```bash
-# Optional: make it executable
-chmod +x juniper_sanitise.py
+chmod +x juniper_sanitise.py   # optional
 ```
 
 ---
@@ -80,74 +81,207 @@ chmod +x juniper_sanitise.py
 python juniper_sanitise.py -i INPUT [-o OUTPUT] [options]
 ```
 
-### Arguments
+### Core arguments
 
 | Argument | Description |
 |----------|-------------|
-| `-i`, `--input` | Input file or directory (required) |
+| `-i`, `--input` | Input file or directory (required unless using `--list-items`) |
 | `-o`, `--output` | Output file or directory. Defaults to `<input>_sanitised` alongside the source |
 | `--seed TEXT` | Determinism seed. Same seed = same tokens every run. Default: `juniper-sanitise` |
-| `--no-ips` | Skip IPv4 address anonymisation |
-| `--no-descriptions` | Skip description line anonymisation |
 | `--dump-map FILE` | Write the full `original → token` mapping to a JSON file |
 | `--dry-run` | Print sanitised output to stdout; do not write any files |
 | `--extensions` | Comma-separated file extensions to process. Default: `.conf,.txt,.cfg,.log` |
 
+### Selection flags
+
+All selection flags accept comma-separated lists. Run `--list-items` to see all
+valid group, pass, and item IDs.
+
+| Flag | Description |
+|------|-------------|
+| `--skip-group GROUPS` | Skip entire groups |
+| `--only-group GROUPS` | Run only these groups; skip all others |
+| `--skip-pass PASSES` | Skip specific passes |
+| `--only-pass PASSES` | Run only these passes; skip all others |
+| `--skip ITEMS` | Skip specific items |
+| `--only ITEMS` | Run only these items; skip all others |
+| `--list-items` | Print the full group → pass → item hierarchy and exit |
+
+### Legacy flags (retained for backward compatibility)
+
+| Flag | Equivalent | Description |
+|------|-----------|-------------|
+| `--no-ips` | `--skip-group addressing` | Skip all IP address anonymisation |
+| `--no-descriptions` | `--skip-pass descriptions` | Skip all description anonymisation |
+
 ### Examples
 
 ```bash
-# Sanitise a directory of configs with a project-specific seed
+# Sanitise a directory with a project-specific seed
 python juniper_sanitise.py -i ./configs/ -o ./sanitised/ --seed myproject
 
-# Sanitise a single file and save the token mapping for reference
+# Sanitise a single file and save the token mapping
 python juniper_sanitise.py -i router.conf -o router_clean.conf --dump-map map.json
 
 # Preview sanitised output without writing any files
 python juniper_sanitise.py -i router.conf --dry-run --seed myproject
 
-# Sanitise named objects only — keep real IPs and descriptions
-python juniper_sanitise.py -i ./configs/ -o ./sanitised/ --no-ips --no-descriptions
+# Show all selectable group, pass, and item IDs
+python juniper_sanitise.py --list-items
+
+# Skip all credentials — keep named objects, IPs, and AS numbers
+python juniper_sanitise.py -i router.conf --skip-group credentials
+
+# Skip only routing protocol authentication keys
+python juniper_sanitise.py -i router.conf --skip-pass routing-auth
+
+# Skip individual items
+python juniper_sanitise.py -i router.conf --skip ntp-keys,login-banner
+
+# Run only named-object and addressing passes — skip everything else
+python juniper_sanitise.py -i router.conf --only-group named-objects,addressing
+
+# Run only identity and BGP group named objects
+python juniper_sanitise.py -i router.conf --only-pass identity,bgp-objects
+
+# Run only specific items
+python juniper_sanitise.py -i router.conf --only hostname,ipv4-addresses,bgp-keys
 ```
+
+---
+
+## Selectable Actions Hierarchy
+
+The full group → pass → item hierarchy. Any level can be targeted with selection
+flags. Run `--list-items` for the same output from the command line.
+
+```
+GROUP: credentials
+  PASS: local-auth
+    root-password          root-authentication encrypted/plain-text password
+    user-passwords         login user encrypted-password and plain-text-password-value
+    ssh-keys               login user ssh-rsa / ssh-dsa / ssh-ecdsa / ssh-ed25519 blobs
+  PASS: routing-auth
+    bgp-keys               BGP authentication-key (all neighbors and groups)
+    ospf-keys              OSPF MD5 key (set-format and block-format)
+    isis-keys              IS-IS authentication-key (interface and global)
+    ntp-keys               NTP authentication-key value
+  PASS: aaa-keys
+    radius-secrets         RADIUS server secret (set and block)
+    tacacs-secrets         TACACS+ server secret (set and block)
+  PASS: vpn-keys
+    ike-psk                IKE pre-shared-key ascii-text / hexadecimal
+  PASS: snmpv3-keys
+    snmpv3-passwords       SNMPv3 authentication-password and privacy-password
+  PASS: pki
+    certificate-data       certificate { } blocks and inline PKI certificate data
+  PASS: informational
+    login-banner           system login announcement and message
+    snmp-contact           snmp contact free text
+    snmp-location          snmp location free text
+
+GROUP: snmp
+  PASS: snmp
+    snmp-communities       SNMP community name def and trap-group name (tokenised)
+    snmp-location          snmp location → <REMOVED>  [shared with credentials/informational]
+    snmp-contact           snmp contact  → <REMOVED>  [shared with credentials/informational]
+
+GROUP: bgp-topology
+  PASS: as-numbers
+    bgp-asn                routing-options autonomous-system, BGP local-as, peer-as
+    vrf-rd-rt              route-distinguisher and vrf-target AS:tag values
+    community-values       target: / origin: / members AS:tag values (inline)
+    bgp-confederation      confederation identifier and peers
+
+GROUP: named-objects
+  PASS: identity
+    hostname               system host-name
+    domain-name            system domain-name and domain-search
+    usernames              system login user NAME
+  PASS: routing-policy
+    policy-statements      policy-options policy-statement (def + export/import refs)
+    firewall-filters       firewall filter (def + interface input/output refs)
+    prefix-lists           policy-options prefix-list (def + from prefix-list refs)
+    communities            policy-options community (def + from/then community refs)
+  PASS: bgp-objects
+    bgp-groups             protocols bgp group (def only; neighbor IPs via addressing)
+  PASS: network-objects
+    routing-instances      routing-instances NAME — VRF equivalent (def + refs)
+    security-zones         security zones security-zone (def + from-zone/to-zone refs)
+    address-books          security address-book NAME
+    nat-rulesets           security nat source/dest/static rule-set NAME
+  PASS: aaa-objects
+    aaa-profiles           access profile NAME
+  PASS: vpn-objects
+    ike-proposals          security ike proposal NAME
+    ike-policies           security ike policy NAME
+    ike-gateways           security ike gateway NAME
+    ipsec-proposals        security ipsec proposal NAME
+    ipsec-policies         security ipsec policy NAME
+    ipsec-vpns             security ipsec vpn NAME
+  PASS: cos-objects
+    cos-schedulers         class-of-service schedulers NAME
+    cos-classifiers        class-of-service classifiers dscp NAME
+    cos-forwarding-classes class-of-service forwarding-classes class NAME
+    cos-scheduler-maps     class-of-service scheduler-maps NAME (def + interface ref)
+
+GROUP: ntp-objects
+  PASS: ntp-objects
+    ntp-key-ids            system ntp authentication-key N ID
+
+GROUP: addressing
+  PASS: ipv4
+    ipv4-addresses         all IPv4 host addresses → IPv4-xxxx tokens
+  PASS: ipv6
+    ipv6-addresses         all IPv6 host addresses → IPv6-xxxx tokens
+
+GROUP: descriptions
+  PASS: descriptions
+    set-descriptions       set ... description text  (set-format lines)
+    block-descriptions     description text;          (block-format lines)
+```
+
+### Precedence rules
+
+Flags are applied in this order (lowest to highest priority):
+
+1. Start with all items enabled
+2. `--skip-group` — disable all items in named groups
+3. `--only-group` — disable all items not in named groups
+4. `--skip-pass`  — disable all items in named passes
+5. `--only-pass`  — disable all items not in named passes
+6. `--skip`       — disable named items individually
+7. `--only`       — disable all items not explicitly named
+
+`--skip` and `--only` are mutually exclusive at the same level (e.g. you cannot
+combine `--skip foo` and `--only bar`). Combining flags at different levels is valid
+and useful: `--skip-group credentials --only-pass routing-auth` expresses
+"skip all credentials except routing protocol auth keys".
+
+### Shared item IDs
+
+`snmp-contact` and `snmp-location` appear in both `credentials/informational` and
+`snmp`. They share a single item ID, so disabling either path disables both.
 
 ---
 
 ## How It Works
 
-The script runs five sequential passes over each config file:
+The script runs seven sequential passes over each config file:
 
 1. **Credentials** — pattern-matches credential lines for all set-format and
-   block-format Junos variants and replaces values with `<REMOVED>`; also covers
-   SSH public keys, SNMP auth/priv passwords, IKE pre-shared keys, NTP key values,
-   certificate blocks, and login announcement/message text
-2. **SNMP** — tokenises community strings; redacts location and contact strings
-3. **AS numbers** — replaces BGP AS numbers and community values with `AS-xxxx`
-   tokens, including confederation, local-as, route-distinguisher, and
-   vrf-target/target: community values
+   block-format Junos variants and replaces values with `<REMOVED>`
+2. **SNMP** — tokenises community strings; location and contact are redacted in pass 1
+3. **AS numbers** — replaces BGP AS numbers and community values with `AS-xxxx` tokens
 4. **Named objects** — replaces all named configuration objects with deterministic
-   `prefix-xxxx` tokens (see Token Reference below)
+   `prefix-xxxx` tokens
 5. **Descriptions** — replaces all description text with `desc-xxxx` tokens
 6. **IPv4 addresses** — replaces host addresses with `IPv4-xxxx` tokens
-7. **IPv6 addresses** — replaces host addresses with `IPv6-xxxx` tokens;
-   link-local, loopback, multicast, and unspecified addresses are preserved
+7. **IPv6 addresses** — replaces host addresses with `IPv6-xxxx` tokens
 
 Each token is derived from a SHA-256 hash of `seed:category:original_value`, so the
 same value always maps to the same token within a run and across runs using the same
-seed. A routing-instance name referenced in ten places will carry the same `vrf-xxxx`
-token in all ten places in the output.
-
-### Seed confidentiality
-
-**Treat the seed as sensitive.** SHA-256 is one-way, so a token alone cannot be
-reversed to its source value. However, anyone with the seed and the script can perform
-a forward lookup: compute the expected token for any candidate value and check whether
-it matches the output. For IP addresses this is a practical threat — RFC 1918 space
-is small enough to enumerate exhaustively in seconds. For named objects the risk
-depends on whether an attacker can guess your naming conventions.
-
-The sanitised-output banner records a **16-character SHA-256 fingerprint** of the
-seed (not the seed itself). This lets two files be verified as sharing the same seed
-— and therefore having consistent, comparable tokens — without exposing the seed to
-anyone who reads the sanitised output.
+seed.
 
 ---
 
@@ -217,48 +351,14 @@ identical across platforms.
 
 - CIDR prefix lengths — `/24`, `/32`, `/64`, `/128`, etc.
 - Subnet masks — `255.255.255.0`, `255.255.0.0`, etc.
-- Loopback range — the entire `127.0.0.0/8` range; note that a routable IP assigned
-  to a `lo0` interface (e.g. `10.0.0.1`) is **not** preserved — the script operates
-  on address values, not interface names
+- Loopback range — the entire `127.0.0.0/8` range
 - Special addresses — `0.0.0.0` and `255.255.255.255` exactly
 - IPv6 link-local (`fe80::/10`), loopback (`::1`), multicast (`ff00::/8`), and
   unspecified (`::`) addresses
-- Junos syntax keywords — `accept`, `reject`, `discard`, `next`, `permit`, `deny`,
-  `inet`, `inet6`, `internal`, `external`, `local`, `default`, etc.
-- Config structure — indentation, `{` `}` delimiters, `;` terminators, comment lines
-  (`#`), blank lines, and `version` / `last changed` header lines
-
----
-
-## Output Example
-
-**Before:**
-```
-set system host-name MX-CORE-LON-01
-set system domain-name corp.internal
-set system root-authentication encrypted-password "$6$abc123$hashedpassword"
-set interfaces xe-0/0/0 unit 0 family inet address 10.100.0.1/30
-set interfaces xe-0/0/0 unit 0 family inet6 address 2001:db8:100:1::1/64
-set routing-options autonomous-system 65001
-set protocols bgp group UPSTREAM-PEERS peer-as 65100
-set protocols bgp group UPSTREAM-PEERS neighbor 10.100.0.2 authentication-key "bgpSecretKey1"
-set snmp community public-ro authorization read-only
-set snmp location "London Core DC - Row 4 Rack 12"
-```
-
-**After** (`--seed myproject`):
-```
-set system host-name host-c170
-set system domain-name dom-005b
-set system root-authentication encrypted-password <REMOVED>
-set interfaces xe-0/0/0 unit 0 family inet address IPv4-3011/30
-set interfaces xe-0/0/0 unit 0 family inet6 address IPv6-17b7/64
-set routing-options autonomous-system AS-2b08
-set protocols bgp group bgrp-6dae peer-as AS-8a26
-set protocols bgp group bgrp-6dae neighbor IPv4-ac63 authentication-key <REMOVED>
-set snmp community snmp-f7d9 authorization read-only
-set snmp location <REMOVED>
-```
+- Junos syntax keywords — `accept`, `reject`, `discard`, `next`, `inet`, `inet6`,
+  `internal`, `external`, `local`, `default`, `permit`, `deny`, etc.
+- Config structure — `{` `}` delimiters, `;` terminators, indentation,
+  `#` comment lines, blank lines, and `version` / `last changed` header lines
 
 ---
 
@@ -332,21 +432,20 @@ grouped by category. Use this to reverse-look up any token in the sanitised outp
 
 | Item | Detail |
 |------|--------|
-| **`apply-groups` references** | Group names in `apply-groups` and `groups` stanzas are not tokenised. Group stanza contents are sanitised normally but the group name itself is preserved. |
-| **`event-options` policy names** | Event policy names under `event-options` are not tokenised. |
-| **Dynamic tunnel endpoints** | Tunnel endpoint IPs (`dynamic-tunnels` stanza) are anonymised by the IP pass but the tunnel group name is not tokenised. |
-| **Hostnames in description lines** | If a real hostname appears inside a description string, the description token replaces the whole string (good), but the original text is visible in the mapping file. |
-| **FQDN-based authentication servers** | RADIUS/TACACS+ servers configured with a hostname rather than an IP address will have the hostname anonymised by the description pass only if it appears in a description context; the server address field itself is not tokenised as a named object. Server IPs are anonymised by the IP pass. |
-| **Block-format NAT / address-book names** | NAT rule-set and address-book names are matched in set-format only; block-format equivalents are not currently covered. |
+| **`apply-groups` references** | Group names in `apply-groups` and `groups` stanzas are not tokenised |
+| **`event-options` policy names** | Event policy names under `event-options` are not tokenised |
+| **Dynamic tunnel group names** | `dynamic-tunnels` group names are not tokenised; endpoint IPs are anonymised |
+| **Block-format NAT / address-book names** | NAT rule-set and address-book names are matched in set-format only |
+| **FQDN-based authentication servers** | RADIUS/TACACS+ servers configured with a hostname rather than an IP are not tokenised |
+| **Hostnames in description lines** | If a real hostname appears inside a description string, the description token replaces the whole string, but the original text is visible in the mapping file |
 
 ---
 
 ## Testing
 
 Two sample configs are included in `test_configs/` covering set-format and
-curly-brace format and exercising all sanitisation rules including IPv6.
-See `TEST_REFERENCE.md` for the full rule coverage matrix and verification
-checklist.
+curly-brace format and exercising all sanitisation rules. See `TEST_REFERENCE.md`
+for the full rule coverage matrix and verification checklist.
 
 ```bash
 python juniper_sanitise.py \

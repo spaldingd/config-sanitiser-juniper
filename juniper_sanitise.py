@@ -20,18 +20,15 @@ AS numbers     : routing-options autonomous-system, bgp group remote-as,
                  confederation AS — consistent AS-xxxx tokens
 SNMP           : community names → consistent tokens (traceable across config),
                  SNMP trap-group targets, SNMP location, SNMP contact
-Syslog         : syslog host targets (IP anonymised by IP pass)
 Banners        : login announcement / message body → <REMOVED>
 Named objects  : hostnames, domain names, usernames, routing-instances (VRF),
                  routing-policies, firewall filters, prefix-lists/sets,
                  community terms, policy-statements, class-of-service (CoS)
                  schedulers/classifiers/forwarding-classes, BGP groups,
                  IKE proposals/policies/gateways, IPsec proposals/policies/VPNs,
-                 security zones, address-books, interfaces (logical names left;
-                 addresses anonymised), LLDP chassis-id (anonymised with IP pass),
-                 NTP authentication keys, keychains, RADIUS/TACACS+ server names,
-                 aaa access-profiles, NAT rule-sets
-Descriptions   : all free-text description / remark lines → desc-xxxx tokens
+                 security zones, address-books, NAT rule-sets,
+                 aaa access-profiles
+Descriptions   : all free-text description lines → desc-xxxx tokens
 
 Junos format support
 ─────────────────────
@@ -40,12 +37,25 @@ Both config formats produced by Junos are handled:
   curly-brace  (hierarchical block syntax, indented with { } delimiters)
 Many real configs mix both or are exported in one form; the script handles either.
 
+Selectable actions
+──────────────────
+Every sanitisation action belongs to a three-level hierarchy:
+  Group → Pass → Item
+All three levels can be targeted with --skip-* / --only-* flags. Run
+  python juniper_sanitise.py --list-items
+to see the full hierarchy of valid IDs.
+
 Usage
 ─────
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --seed myproject
   python juniper_sanitise.py -i router.conf -o router_clean.conf --dump-map map.json
   python juniper_sanitise.py -i router.conf --dry-run
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --no-ips --no-descriptions
+  python juniper_sanitise.py -i router.conf --skip-group credentials
+  python juniper_sanitise.py -i router.conf --skip-pass routing-auth,vpn-keys
+  python juniper_sanitise.py -i router.conf --skip ntp-keys,ospf-keys
+  python juniper_sanitise.py -i router.conf --only-group named-objects,addressing
+  python juniper_sanitise.py --list-items
 """
 
 import re
@@ -54,8 +64,275 @@ import json
 import hashlib
 import argparse
 import ipaddress
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HIERARCHY  —  group → pass → (item_id, description)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Each leaf is (item_id, one-line description for --list-items)
+HIERARCHY: dict[str, dict[str, list[tuple[str, str]]]] = {
+    "credentials": {
+        "local-auth": [
+            ("root-password",   "root-authentication encrypted/plain-text password"),
+            ("user-passwords",  "login user encrypted-password and plain-text-password-value"),
+            ("ssh-keys",        "login user ssh-rsa / ssh-dsa / ssh-ecdsa / ssh-ed25519 blobs"),
+        ],
+        "routing-auth": [
+            ("bgp-keys",        "BGP authentication-key (all neighbors and groups)"),
+            ("ospf-keys",       "OSPF MD5 key (set-format and block-format)"),
+            ("isis-keys",       "IS-IS authentication-key (interface and global)"),
+            ("ntp-keys",        "NTP authentication-key value"),
+        ],
+        "aaa-keys": [
+            ("radius-secrets",  "RADIUS server secret (set and block)"),
+            ("tacacs-secrets",  "TACACS+ server secret (set and block)"),
+        ],
+        "vpn-keys": [
+            ("ike-psk",         "IKE pre-shared-key ascii-text / hexadecimal"),
+        ],
+        "snmpv3-keys": [
+            ("snmpv3-passwords", "SNMPv3 authentication-password and privacy-password"),
+        ],
+        "pki": [
+            ("certificate-data", "certificate { } blocks and inline PKI certificate data"),
+        ],
+        "informational": [
+            ("login-banner",    "system login announcement and message"),
+            ("snmp-contact",    "snmp contact free text"),
+            ("snmp-location",   "snmp location free text"),
+        ],
+    },
+    "snmp": {
+        "snmp": [
+            ("snmp-communities", "SNMP community name def and trap-group name (tokenised)"),
+            ("snmp-location",    "snmp location → <REMOVED>  [shared with credentials/informational]"),
+            ("snmp-contact",     "snmp contact  → <REMOVED>  [shared with credentials/informational]"),
+        ],
+    },
+    "bgp-topology": {
+        "as-numbers": [
+            ("bgp-asn",          "routing-options autonomous-system, BGP local-as, peer-as"),
+            ("vrf-rd-rt",        "route-distinguisher and vrf-target AS:tag values"),
+            ("community-values", "target: / origin: / members AS:tag values (inline)"),
+            ("bgp-confederation","confederation identifier and peers"),
+        ],
+    },
+    "named-objects": {
+        "identity": [
+            ("hostname",         "system host-name"),
+            ("domain-name",      "system domain-name and domain-search"),
+            ("usernames",        "system login user NAME"),
+        ],
+        "routing-policy": [
+            ("policy-statements","policy-options policy-statement (def + export/import refs)"),
+            ("firewall-filters", "firewall filter (def + interface input/output refs)"),
+            ("prefix-lists",     "policy-options prefix-list (def + from prefix-list refs)"),
+            ("communities",      "policy-options community (def + from/then community refs)"),
+        ],
+        "bgp-objects": [
+            ("bgp-groups",       "protocols bgp group (def only; neighbor IPs via addressing)"),
+        ],
+        "network-objects": [
+            ("routing-instances","routing-instances NAME — VRF equivalent (def + refs)"),
+            ("security-zones",   "security zones security-zone (def + from-zone/to-zone refs)"),
+            ("address-books",    "security address-book NAME"),
+            ("nat-rulesets",     "security nat source/dest/static rule-set NAME"),
+        ],
+        "aaa-objects": [
+            ("aaa-profiles",     "access profile NAME"),
+        ],
+        "vpn-objects": [
+            ("ike-proposals",    "security ike proposal NAME"),
+            ("ike-policies",     "security ike policy NAME"),
+            ("ike-gateways",     "security ike gateway NAME"),
+            ("ipsec-proposals",  "security ipsec proposal NAME"),
+            ("ipsec-policies",   "security ipsec policy NAME"),
+            ("ipsec-vpns",       "security ipsec vpn NAME"),
+        ],
+        "cos-objects": [
+            ("cos-schedulers",        "class-of-service schedulers NAME"),
+            ("cos-classifiers",       "class-of-service classifiers dscp NAME"),
+            ("cos-forwarding-classes","class-of-service forwarding-classes class NAME"),
+            ("cos-scheduler-maps",    "class-of-service scheduler-maps NAME (def + interface ref)"),
+        ],
+    },
+    "ntp-objects": {
+        "ntp-objects": [
+            ("ntp-key-ids", "system ntp authentication-key N ID (value redacted by ntp-keys)"),
+        ],
+    },
+    "addressing": {
+        "ipv4": [
+            ("ipv4-addresses", "all IPv4 host addresses → IPv4-xxxx tokens"),
+        ],
+        "ipv6": [
+            ("ipv6-addresses", "all IPv6 host addresses → IPv6-xxxx tokens"),
+        ],
+    },
+    "descriptions": {
+        "descriptions": [
+            ("set-descriptions",   "set ... description text  (set-format lines)"),
+            ("block-descriptions", "description text;          (block-format lines)"),
+        ],
+    },
+}
+
+# Derived flat sets used by resolve_config
+ALL_ITEM_IDS: frozenset[str] = frozenset(
+    item_id
+    for passes in HIERARCHY.values()
+    for items in passes.values()
+    for item_id, _ in items
+)
+
+_PASS_TO_ITEMS: dict[str, frozenset[str]] = {
+    pass_name: frozenset(item_id for item_id, _ in items)
+    for passes in HIERARCHY.values()
+    for pass_name, items in passes.items()
+}
+
+_GROUP_TO_ITEMS: dict[str, frozenset[str]] = {
+    group_name: frozenset(
+        item_id
+        for items in passes.values()
+        for item_id, _ in items
+    )
+    for group_name, passes in HIERARCHY.items()
+}
+
+# Item descriptions for --list-items
+_ITEM_DESCRIPTIONS: dict[str, str] = {
+    item_id: desc
+    for passes in HIERARCHY.values()
+    for items in passes.values()
+    for item_id, desc in items
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SANITISER CONFIG  —  resolved set of enabled item IDs
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SanitiserConfig:
+    enabled_items: frozenset[str] = field(
+        default_factory=lambda: frozenset(ALL_ITEM_IDS)
+    )
+
+    def enabled(self, item_id: str) -> bool:
+        return item_id in self.enabled_items
+
+    @classmethod
+    def all_enabled(cls) -> "SanitiserConfig":
+        return cls(enabled_items=frozenset(ALL_ITEM_IDS))
+
+
+def _parse_csv(value: str) -> list[str]:
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _items_in_group(group: str) -> frozenset[str]:
+    if group not in _GROUP_TO_ITEMS:
+        raise ValueError(
+            f"Unknown group: '{group}'. "
+            f"Valid groups: {', '.join(sorted(_GROUP_TO_ITEMS))}"
+        )
+    return _GROUP_TO_ITEMS[group]
+
+
+def _items_in_pass(pass_name: str) -> frozenset[str]:
+    if pass_name not in _PASS_TO_ITEMS:
+        raise ValueError(
+            f"Unknown pass: '{pass_name}'. "
+            f"Valid passes: {', '.join(sorted(_PASS_TO_ITEMS))}"
+        )
+    return _PASS_TO_ITEMS[pass_name]
+
+
+def resolve_config(args: argparse.Namespace) -> SanitiserConfig:
+    """
+    Apply group → pass → item selection flags in precedence order and return
+    the resolved SanitiserConfig.
+
+    Precedence (lowest → highest):
+      1. Start: all items enabled
+      2. --skip-group  : disable all items in named groups
+      3. --only-group  : disable all items NOT in named groups
+      4. --skip-pass   : disable all items in named passes
+      5. --only-pass   : disable all items NOT in named passes
+      6. --skip        : disable named items individually
+      7. --only        : disable all items not explicitly named
+    """
+    # Mutual exclusion checks at each level
+    if getattr(args, "skip_group", None) and getattr(args, "only_group", None):
+        raise ValueError("--skip-group and --only-group are mutually exclusive.")
+    if getattr(args, "skip_pass", None) and getattr(args, "only_pass", None):
+        raise ValueError("--skip-pass and --only-pass are mutually exclusive.")
+    if getattr(args, "skip", None) and getattr(args, "only", None):
+        raise ValueError("--skip and --only are mutually exclusive.")
+
+    enabled = set(ALL_ITEM_IDS)                         # step 1
+
+    if getattr(args, "skip_group", None):
+        for g in _parse_csv(args.skip_group):
+            enabled -= _items_in_group(g)               # step 2
+
+    if getattr(args, "only_group", None):
+        keep: set[str] = set()
+        for g in _parse_csv(args.only_group):
+            keep |= _items_in_group(g)
+        enabled &= keep                                  # step 3
+
+    if getattr(args, "skip_pass", None):
+        for p in _parse_csv(args.skip_pass):
+            enabled -= _items_in_pass(p)                # step 4
+
+    if getattr(args, "only_pass", None):
+        keep = set()
+        for p in _parse_csv(args.only_pass):
+            keep |= _items_in_pass(p)
+        enabled &= keep                                  # step 5
+
+    if getattr(args, "skip", None):
+        for item in _parse_csv(args.skip):
+            if item not in ALL_ITEM_IDS:
+                raise ValueError(
+                    f"Unknown item: '{item}'. Run --list-items to see valid IDs."
+                )
+            enabled.discard(item)                       # step 6
+
+    if getattr(args, "only", None):
+        keep = set()
+        for item in _parse_csv(args.only):
+            if item not in ALL_ITEM_IDS:
+                raise ValueError(
+                    f"Unknown item: '{item}'. Run --list-items to see valid IDs."
+                )
+            keep.add(item)
+        enabled &= keep                                  # step 7
+
+    # Legacy aliases: --no-ips and --no-descriptions
+    if getattr(args, "no_ips", False):
+        enabled -= _items_in_group("addressing")
+    if getattr(args, "no_descriptions", False):
+        enabled -= _items_in_pass("descriptions")
+
+    return SanitiserConfig(enabled_items=frozenset(enabled))
+
+
+def print_list_items() -> None:
+    """Print the full group → pass → item hierarchy and exit."""
+    print("\n  Selectable sanitisation actions\n")
+    for group_name, passes in HIERARCHY.items():
+        print(f"  GROUP: {group_name}")
+        for pass_name, items in passes.items():
+            print(f"    PASS: {pass_name}")
+            for item_id, desc in items:
+                print(f"      {item_id:<28}  {desc}")
+        print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -63,7 +340,6 @@ from pathlib import Path
 # ══════════════════════════════════════════════════════════════════════════════
 
 RESERVED_KEYWORDS = {
-    # Junos syntax keywords that must never be treated as object names
     "default", "any", "all", "none", "permit", "deny", "in", "out",
     "input", "output", "both", "true", "false", "enable", "disable",
     "active", "inactive", "static", "dynamic", "unicast", "multicast",
@@ -114,7 +390,6 @@ CATEGORY_PREFIXES = {
     "ipv6_address":       "IPv6",
 }
 
-# Standard subnet/prefix masks
 _SUBNET_MASK_RE = re.compile(
     r'\b(?:255|254|252|248|240|224|192|128|0)'
     r'\.(?:255|254|252|248|240|224|192|128|0)'
@@ -126,10 +401,6 @@ _IP_RE = re.compile(
     r'\b((?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
 )
 
-# Junos firewall term from/to lines with address match (second IP is not a wildcard
-# in Junos — all masks are CIDR — so no wildcard-skip logic needed for IPv4 in Junos)
-
-# IPv6 regex — same as Cisco script (RFC 5952 all compressed forms)
 _IPV6_RE = re.compile(r"""(?<![:\w./])(
     (?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}             |
     (?:[0-9a-fA-F]{1,4}:){1,7}:                           |
@@ -145,9 +416,6 @@ _IPV6_RE = re.compile(r"""(?<![:\w./])(
 
 
 def _collect_skip_spans_v4(text: str) -> set[tuple[int, int]]:
-    """Spans of IPv4-like values that must NOT be anonymised (subnet masks only).
-    Junos uses CIDR exclusively — no wildcard mask fields — so only standard
-    subnet masks need skipping."""
     skip: set[tuple[int, int]] = set()
     for m in _SUBNET_MASK_RE.finditer(text):
         skip.add(m.span())
@@ -257,12 +525,26 @@ class IPAnonymiser:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class JuniperSanitiser:
-    def __init__(self, seed: str = "juniper-sanitise",
+    def __init__(self,
+                 seed: str = "juniper-sanitise",
+                 cfg: "SanitiserConfig | None" = None,
+                 # Legacy keyword aliases — retained for backward compatibility
                  anonymise_ips: bool = True,
                  anonymise_descriptions: bool = True):
         self.tokens = TokenGenerator(seed=seed)
-        self.ip_anon = IPAnonymiser(self.tokens) if anonymise_ips else None
-        self.anonymise_descriptions = anonymise_descriptions
+        # If a SanitiserConfig is provided it takes precedence; otherwise
+        # translate legacy boolean flags into an equivalent config.
+        if cfg is not None:
+            self.cfg = cfg
+        else:
+            enabled = set(ALL_ITEM_IDS)
+            if not anonymise_ips:
+                enabled -= _items_in_group("addressing")
+            if not anonymise_descriptions:
+                enabled -= _items_in_pass("descriptions")
+            self.cfg = SanitiserConfig(enabled_items=frozenset(enabled))
+
+        self.ip_anon = IPAnonymiser(self.tokens)
         self._log: list[str] = []
 
     # ─────────────────────────────────────────── public ──────────────────
@@ -273,11 +555,11 @@ class JuniperSanitiser:
         text = self._pass_snmp(text)
         text = self._pass_as_numbers(text)
         text = self._pass_named_objects(text)
-        if self.anonymise_descriptions:
-            text = self._pass_descriptions(text)
-        if self.ip_anon:
+        text = self._pass_descriptions(text)
+        if self.cfg.enabled("ipv4-addresses"):
             text = self.ip_anon.anonymise(text)
             self._log.append("  [IP]  IPv4 host addresses anonymised")
+        if self.cfg.enabled("ipv6-addresses"):
             text = self.ip_anon.anonymise_v6(text)
             self._log.append("  [IP]  IPv6 host addresses anonymised")
         return text
@@ -321,160 +603,146 @@ class JuniperSanitiser:
 
     def _pass_credentials(self, text: str) -> str:
         S = self._sub
+        C = self.cfg.enabled
 
-        # ── Authentication passwords ───────────────────────────────────────
+        # ── local-auth ────────────────────────────────────────────────────
 
-        # set system root-authentication encrypted-password "..."
-        # set system root-authentication plain-text-password-value "..."
-        text = S(re.compile(
-            r'^(set\s+system\s+root-authentication\s+(?:encrypted-password|plain-text-password-value)\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "root-authentication password (set)")
+        if C("root-password"):
+            text = S(re.compile(
+                r'^(set\s+system\s+root-authentication\s+'
+                r'(?:encrypted-password|plain-text-password-value)\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "root-authentication password (set)")
 
-        # curly-brace: encrypted-password "$...";
-        # plain-text-password-value "...";
-        text = S(re.compile(
-            r'^(\s*(?:encrypted-password|plain-text-password-value)\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "encrypted-password / plain-text-password (block)")
+            text = S(re.compile(
+                r'^(\s*(?:encrypted-password|plain-text-password-value)\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text,
+                "encrypted-password / plain-text-password (block)")
 
-        # set system login user NAME authentication encrypted-password "..."
-        # set system login user NAME authentication plain-text-password-value "..."
-        text = S(re.compile(
-            r'^(set\s+system\s+login\s+user\s+\S+\s+authentication\s+'
-            r'(?:encrypted-password|plain-text-password-value)\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "login user authentication password (set)")
+            text = S(re.compile(
+                r'^(set\s+system\s+login\s+user\s+\S+\s+authentication\s+'
+                r'(?:encrypted-password|plain-text-password-value)\s+)\S+',
+                re.M), r'\1<REMOVED>', text,
+                "login user authentication password (set)")
 
-        # SSH public-key blob (rsa-public-key, dsa-public-key, ecdsa-sha2-nistp256-public-key, ed25519-public-key)
-        # set system login user NAME authentication ssh-rsa "..."
-        text = S(re.compile(
-            r'^(set\s+system\s+login\s+user\s+\S+\s+authentication\s+'
-            r'(?:ssh-rsa|ssh-dsa|ssh-ecdsa|ssh-ed25519)\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "login user SSH public-key (set)")
+        if C("ssh-keys"):
+            text = S(re.compile(
+                r'^(set\s+system\s+login\s+user\s+\S+\s+authentication\s+'
+                r'(?:ssh-rsa|ssh-dsa|ssh-ecdsa|ssh-ed25519)\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "login user SSH public-key (set)")
 
-        # block: ssh-rsa "..."; / ssh-dsa "..."; etc.
-        text = S(re.compile(
-            r'^(\s*(?:ssh-rsa|ssh-dsa|ssh-ecdsa|ssh-ed25519)\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "SSH public-key (block)")
+            text = S(re.compile(
+                r'^(\s*(?:ssh-rsa|ssh-dsa|ssh-ecdsa|ssh-ed25519)\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text, "SSH public-key (block)")
 
-        # RADIUS secret: set access radius-server IP [port N] secret "..."
-        # Optional intermediate tokens (port N, timeout N, etc.) before secret keyword
-        text = S(re.compile(
-            r'^(set\s+access\s+radius-server\s+\S+(?:\s+\S+)*?\s+secret\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "RADIUS server secret (set)")
+        # ── aaa-keys ──────────────────────────────────────────────────────
 
-        # block: secret "...";  (inside radius-server or tacacs-plus-server stanza)
-        text = S(re.compile(
-            r'^(\s*secret\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "AAA server secret (block)")
+        if C("radius-secrets"):
+            text = S(re.compile(
+                r'^(set\s+access\s+radius-server\s+\S+(?:\s+\S+)*?\s+secret\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "RADIUS server secret (set)")
 
-        # TACACS+ secret: set access tacplus-server IP [port N] secret "..."
-        text = S(re.compile(
-            r'^(set\s+access\s+tacplus-server\s+\S+(?:\s+\S+)*?\s+secret\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "TACACS+ server secret (set)")
+            text = S(re.compile(
+                r'^(\s*secret\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text, "AAA server secret (block)")
 
-        # BGP authentication key
-        # set protocols bgp group NAME neighbor IP authentication-key "..."
-        text = S(re.compile(
-            r'^(set\s+protocols\s+bgp\s+.*?authentication-key\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "BGP authentication-key (set)")
+        if C("tacacs-secrets"):
+            text = S(re.compile(
+                r'^(set\s+access\s+tacplus-server\s+\S+(?:\s+\S+)*?\s+secret\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "TACACS+ server secret (set)")
 
-        # block: authentication-key "...";
-        text = S(re.compile(
-            r'^(\s*authentication-key\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "BGP authentication-key (block)")
+        # ── routing-auth ──────────────────────────────────────────────────
 
-        # OSPF / OSPF3 authentication
-        # set protocols ospf area X interface IF authentication md5 KEY-ID key "..."
-        text = S(re.compile(
-            r'^(set\s+protocols\s+ospf3?\s+.*?\s+key\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "OSPF authentication key (set)")
+        if C("bgp-keys"):
+            text = S(re.compile(
+                r'^(set\s+protocols\s+bgp\s+.*?authentication-key\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "BGP authentication-key (set)")
 
-        # block: key "...";  (inside authentication md5 stanza)
-        # Use negative lookbehind to avoid matching "key-id N {" lines
-        text = S(re.compile(
-            r'^(\s*key\s+)(?!\d+\s*[{;])(\S+)\s*;',
-            re.M), r'\1<REMOVED>;', text, "authentication key (block)")
+            text = S(re.compile(
+                r'^(\s*authentication-key\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text, "BGP authentication-key (block)")
 
-        # IS-IS authentication
-        # set protocols isis interface IF level 1 authentication-key "..."
-        # set protocols isis authentication-key "..."
-        text = S(re.compile(
-            r'^(set\s+protocols\s+isis\s+.*?authentication-key\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "IS-IS authentication-key (set)")
+        if C("ospf-keys"):
+            text = S(re.compile(
+                r'^(set\s+protocols\s+ospf3?\s+.*?\s+key\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "OSPF authentication key (set)")
 
-        # NTP authentication-key: set system ntp authentication-key N type md5 value "..."
-        text = S(re.compile(
-            r'^(set\s+system\s+ntp\s+authentication-key\s+\d+\s+\S+\s+value\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "NTP authentication-key value (set)")
+            text = S(re.compile(
+                r'^(\s*key\s+)(?!\d+\s*[{;])(\S+)\s*;',
+                re.M), r'\1<REMOVED>;', text, "authentication key (block)")
 
-        # block: value "...";  (inside ntp authentication-key stanza)
-        text = S(re.compile(
-            r'^(\s*value\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "NTP authentication-key value (block)")
+        if C("isis-keys"):
+            text = S(re.compile(
+                r'^(set\s+protocols\s+isis\s+.*?authentication-key\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "IS-IS authentication-key (set)")
 
-        # IKE pre-shared-key
-        # set security ike policy NAME pre-shared-key ascii-text "..."
-        # set security ike policy NAME pre-shared-key hexadecimal "..."
-        text = S(re.compile(
-            r'^(set\s+security\s+ike\s+policy\s+\S+\s+pre-shared-key\s+(?:ascii-text|hexadecimal)\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "IKE pre-shared-key (set)")
+        if C("ntp-keys"):
+            text = S(re.compile(
+                r'^(set\s+system\s+ntp\s+authentication-key\s+\d+\s+\S+\s+value\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "NTP authentication-key value (set)")
 
-        # block: ascii-text "...";  hexadecimal "...";  (inside pre-shared-key stanza)
-        text = S(re.compile(
-            r'^(\s*(?:ascii-text|hexadecimal)\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "IKE pre-shared-key (block)")
+            text = S(re.compile(
+                r'^(\s*value\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text, "NTP authentication-key value (block)")
 
-        # SNMP authentication / privacy passwords
-        # set snmp v3 usm local-engine user NAME authentication-sha authentication-password "..."
-        # set snmp v3 usm local-engine user NAME privacy-3des privacy-password "..."
-        text = S(re.compile(
-            r'^(set\s+snmp\s+.*?(?:authentication-password|privacy-password)\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "SNMPv3 auth/priv password (set)")
+        # ── vpn-keys ──────────────────────────────────────────────────────
 
-        # block: authentication-password "..."; / privacy-password "...";
-        text = S(re.compile(
-            r'^(\s*(?:authentication-password|privacy-password)\s+)\S+\s*;',
-            re.M), r'\1<REMOVED>;', text, "SNMPv3 auth/priv password (block)")
+        if C("ike-psk"):
+            text = S(re.compile(
+                r'^(set\s+security\s+ike\s+policy\s+\S+\s+pre-shared-key\s+'
+                r'(?:ascii-text|hexadecimal)\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "IKE pre-shared-key (set)")
 
-        # SSL certificate / key data blocks (curly-brace format only)
-        # certificate { ... } blocks containing Base64 data
-        text = S(re.compile(
-            r'(\bcertificate\s+\{[^}]*\})',
-            re.M | re.DOTALL),
-            r'certificate { <REMOVED> }', text, "certificate block")
+            text = S(re.compile(
+                r'^(\s*(?:ascii-text|hexadecimal)\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text, "IKE pre-shared-key (block)")
 
-        # set security pki local-certificate CERT-NAME ... (inline cert references)
-        text = S(re.compile(
-            r'^(set\s+security\s+pki\s+local-certificate\s+\S+\s+certificate\s+)\S+',
-            re.M), r'\1<REMOVED>', text, "PKI local-certificate data (set)")
+        # ── snmpv3-keys ───────────────────────────────────────────────────
 
-        # Login announcement / banner
-        # set system login announcement "..."
-        # set system login message "..."
-        text = S(re.compile(
-            r'^(set\s+system\s+login\s+(?:announcement|message)\s+)\S.*$',
-            re.M), r'\1<REMOVED>', text, "login announcement/message (set)")
+        if C("snmpv3-passwords"):
+            text = S(re.compile(
+                r'^(set\s+snmp\s+.*?(?:authentication-password|privacy-password)\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "SNMPv3 auth/priv password (set)")
 
-        # block: announcement "..."; / message "...";
-        text = S(re.compile(
-            r'^(\s*(?:announcement|message)\s+)\S.*?;$',
-            re.M), r'\1<REMOVED>;', text, "login announcement/message (block)")
+            text = S(re.compile(
+                r'^(\s*(?:authentication-password|privacy-password)\s+)\S+\s*;',
+                re.M), r'\1<REMOVED>;', text, "SNMPv3 auth/priv password (block)")
 
-        # ── Contact / location (sensitive free text) ───────────────────────
+        # ── pki ───────────────────────────────────────────────────────────
 
-        # set snmp contact "..."
-        text = S(re.compile(r'^(set\s+snmp\s+contact\s+).+$', re.M),
-            r'\1<REMOVED>', text, "SNMP contact (set)")
+        if C("certificate-data"):
+            text = S(re.compile(
+                r'(\bcertificate\s+\{[^}]*\})',
+                re.M | re.DOTALL),
+                r'certificate { <REMOVED> }', text, "certificate block")
 
-        # set snmp location "..."
-        text = S(re.compile(r'^(set\s+snmp\s+location\s+).+$', re.M),
-            r'\1<REMOVED>', text, "SNMP location (set)")
+            text = S(re.compile(
+                r'^(set\s+security\s+pki\s+local-certificate\s+\S+\s+certificate\s+)\S+',
+                re.M), r'\1<REMOVED>', text, "PKI local-certificate data (set)")
 
-        # block: contact "...";  location "...";
-        text = S(re.compile(r'^(\s*contact\s+).+;$', re.M),
-            r'\1<REMOVED>;', text, "SNMP contact (block)")
+        # ── informational ─────────────────────────────────────────────────
 
-        text = S(re.compile(r'^(\s*location\s+).+;$', re.M),
-            r'\1<REMOVED>;', text, "SNMP location (block)")
+        if C("login-banner"):
+            text = S(re.compile(
+                r'^(set\s+system\s+login\s+(?:announcement|message)\s+)\S.*$',
+                re.M), r'\1<REMOVED>', text, "login announcement/message (set)")
+
+            text = S(re.compile(
+                r'^(\s*(?:announcement|message)\s+)\S.*?;$',
+                re.M), r'\1<REMOVED>;', text, "login announcement/message (block)")
+
+        if C("snmp-contact"):
+            text = S(re.compile(r'^(set\s+snmp\s+contact\s+).+$', re.M),
+                r'\1<REMOVED>', text, "SNMP contact (set)")
+
+            text = S(re.compile(r'^(\s*contact\s+).+;$', re.M),
+                r'\1<REMOVED>;', text, "SNMP contact (block)")
+
+        if C("snmp-location"):
+            text = S(re.compile(r'^(set\s+snmp\s+location\s+).+$', re.M),
+                r'\1<REMOVED>', text, "SNMP location (set)")
+
+            text = S(re.compile(r'^(\s*location\s+).+;$', re.M),
+                r'\1<REMOVED>;', text, "SNMP location (block)")
 
         return text
 
@@ -482,33 +750,30 @@ class JuniperSanitiser:
 
     def _pass_snmp(self, text: str) -> str:
         N = self._sub_name
-        S = self._sub
+        C = self.cfg.enabled
 
-        # set-format community definitions
-        # set snmp community NAME authorization read-only
-        # set snmp community NAME authorization read-write
-        text = N(re.compile(r'^(set\s+snmp\s+community\s+)(?P<n>\S+)', re.M),
-                 "snmp_community", "SNMP community def (set)", text)
+        if C("snmp-communities"):
+            text = N(re.compile(r'^(set\s+snmp\s+community\s+)(?P<n>\S+)', re.M),
+                     "snmp_community", "SNMP community def (set)", text)
 
-        # block: community NAME { ... }
-        text = N(re.compile(r'^(\s*community\s+)(?P<n>(?!authorization\b|clients\b|routing-instance\b|view\b|restrict\b)\S+)\s*\{',
-                            re.M),
-                 "snmp_community", "SNMP community def (block)", text)
+            text = N(re.compile(
+                r'^(\s*community\s+)'
+                r'(?P<n>(?!authorization\b|clients\b|routing-instance\b|view\b|restrict\b)\S+)'
+                r'\s*\{', re.M),
+                     "snmp_community", "SNMP community def (block)", text)
 
-        # set snmp trap-group GROUP targets IP  — community ref in trap-group
-        # set snmp trap-group GROUP version v2  — group name
-        text = N(re.compile(r'^(set\s+snmp\s+trap-group\s+)(?P<n>\S+)', re.M),
-                 "snmp_community", "SNMP trap-group name", text)
+            text = N(re.compile(r'^(set\s+snmp\s+trap-group\s+)(?P<n>\S+)', re.M),
+                     "snmp_community", "SNMP trap-group name", text)
 
-        # Community ref inside trap-group: set snmp trap-group NAME routing-instance ...
-        # (community name already tokenised above; this catches lingering refs)
-        # Trap target IPs are handled by the IP pass
+        # snmp-contact and snmp-location are handled in pass 1 (credentials/informational).
+        # They share the same item IDs so the guard there covers them.
 
         return text
 
     # ──────────────────────────────── pass 3: AS numbers ─────────────────
 
     def _pass_as_numbers(self, text: str) -> str:
+        C = self.cfg.enabled
 
         def replace_as(m: re.Match) -> str:
             return m.group(1) + self.tokens.get("as_number", m.group(2))
@@ -518,81 +783,86 @@ class JuniperSanitiser:
                     + self.tokens.get("as_number", m.group(2))
                     + m.group(3))
 
-        # routing-options autonomous-system N
-        text = self._sub(
-            re.compile(r'^(set\s+routing-options\s+autonomous-system\s+)(\d+(?:\.\d+)?)', re.M),
-            replace_as, text, "routing-options autonomous-system (set)")
+        if C("bgp-asn"):
+            text = self._sub(
+                re.compile(
+                    r'^(set\s+routing-options\s+autonomous-system\s+)(\d+(?:\.\d+)?)',
+                    re.M),
+                replace_as, text, "routing-options autonomous-system (set)")
 
-        text = self._sub(
-            re.compile(r'^(\s*autonomous-system\s+)(\d+(?:\.\d+)?)\s*;', re.M),
-            lambda m: replace_as(m) + ';', text,
-            "autonomous-system (block)")
+            text = self._sub(
+                re.compile(r'^(\s*autonomous-system\s+)(\d+(?:\.\d+)?)\s*;', re.M),
+                lambda m: replace_as(m) + ';', text, "autonomous-system (block)")
 
-        # confederation
-        text = self._sub(
-            re.compile(r'^(set\s+routing-options\s+confederation\s+)(\d+(?:\.\d+)?)', re.M),
-            replace_as, text, "confederation AS (set)")
+            text = self._sub(
+                re.compile(
+                    r'^(set\s+protocols\s+bgp\s+.*?local-as\s+)(\d+(?:\.\d+)?)',
+                    re.M),
+                replace_as, text, "BGP local-as (set)")
 
-        # confederation peers
-        def replace_confederation_peers(m: re.Match) -> str:
-            prefix = m.group(1)
-            peers = re.sub(
-                r'\d+(?:\.\d+)?',
-                lambda a: self.tokens.get("as_number", a.group(0)),
-                m.group(2))
-            return prefix + peers
-        text = self._sub(
-            re.compile(r'^(set\s+routing-options\s+confederation\s+peers\s+)(.+)$', re.M),
-            replace_confederation_peers, text, "confederation peers (set)")
+            text = self._sub(
+                re.compile(r'^(\s*local-as\s+)(\d+(?:\.\d+)?)\s*;', re.M),
+                lambda m: replace_as(m) + ';', text, "BGP local-as (block)")
 
-        # local-as inside bgp group
-        text = self._sub(
-            re.compile(r'^(set\s+protocols\s+bgp\s+.*?local-as\s+)(\d+(?:\.\d+)?)', re.M),
-            replace_as, text, "BGP local-as (set)")
+            text = self._sub(
+                re.compile(
+                    r'^(set\s+protocols\s+bgp\s+.*?peer-as\s+)(\d+(?:\.\d+)?)',
+                    re.M),
+                replace_as, text, "BGP peer-as (set)")
 
-        text = self._sub(
-            re.compile(r'^(\s*local-as\s+)(\d+(?:\.\d+)?)\s*;', re.M),
-            lambda m: replace_as(m) + ';', text, "BGP local-as (block)")
+            text = self._sub(
+                re.compile(r'^(\s*peer-as\s+)(\d+(?:\.\d+)?)\s*;', re.M),
+                lambda m: replace_as(m) + ';', text, "BGP peer-as (block)")
 
-        # neighbor / group remote-as
-        text = self._sub(
-            re.compile(r'^(set\s+protocols\s+bgp\s+.*?peer-as\s+)(\d+(?:\.\d+)?)', re.M),
-            replace_as, text, "BGP peer-as (set)")
+        if C("bgp-confederation"):
+            text = self._sub(
+                re.compile(
+                    r'^(set\s+routing-options\s+confederation\s+)(\d+(?:\.\d+)?)',
+                    re.M),
+                replace_as, text, "confederation AS (set)")
 
-        text = self._sub(
-            re.compile(r'^(\s*peer-as\s+)(\d+(?:\.\d+)?)\s*;', re.M),
-            lambda m: replace_as(m) + ';', text, "BGP peer-as (block)")
+            def replace_confederation_peers(m: re.Match) -> str:
+                prefix = m.group(1)
+                peers = re.sub(
+                    r'\d+(?:\.\d+)?',
+                    lambda a: self.tokens.get("as_number", a.group(0)),
+                    m.group(2))
+                return prefix + peers
+            text = self._sub(
+                re.compile(
+                    r'^(set\s+routing-options\s+confederation\s+peers\s+)(.+)$',
+                    re.M),
+                replace_confederation_peers, text, "confederation peers (set)")
 
-        # routing-instance rd N:tag
-        text = self._sub(
-            re.compile(r'((?:set\s+)?(?:\s*)route-distinguisher\s+)(\d+(?:\.\d+)?)(:\d+)', re.M),
-            replace_rt, text, "route-distinguisher AS:tag")
+        if C("vrf-rd-rt"):
+            text = self._sub(
+                re.compile(
+                    r'((?:set\s+)?(?:\s*)route-distinguisher\s+)(\d+(?:\.\d+)?)(:\d+)',
+                    re.M),
+                replace_rt, text, "route-distinguisher AS:tag")
 
-        # route-target (vrf-target / vrf-import / vrf-export)
-        text = self._sub(
-            re.compile(
-                r'((?:set\s+)?(?:.*?\s+)?(?:vrf-target|target)\s+)(\d+(?:\.\d+)?)(:\d+)',
-                re.M),
-            replace_rt, text, "route-target / vrf-target AS:tag")
+            text = self._sub(
+                re.compile(
+                    r'((?:set\s+)?(?:.*?\s+)?(?:vrf-target|target)\s+)(\d+(?:\.\d+)?)(:\d+)',
+                    re.M),
+                replace_rt, text, "route-target / vrf-target AS:tag")
 
-        # community values — "target:AS:tag" or bare "AS:tag"
-        text = self._sub(
-            re.compile(r'(\btarget:)(\d+(?:\.\d+)?)(:\d+)', re.M),
-            replace_rt, text, "community target: AS:tag")
+        if C("community-values"):
+            text = self._sub(
+                re.compile(r'(\btarget:)(\d+(?:\.\d+)?)(:\d+)', re.M),
+                replace_rt, text, "community target: AS:tag")
 
-        text = self._sub(
-            re.compile(r'(\borigin:)(\d+(?:\.\d+)?)(:\d+)', re.M),
-            replace_rt, text, "community origin: AS:tag")
+            text = self._sub(
+                re.compile(r'(\borigin:)(\d+(?:\.\d+)?)(:\d+)', re.M),
+                replace_rt, text, "community origin: AS:tag")
 
-        # bare community members: "members [ 65001:100 65001:200 ]"
-        text = self._sub(
-            re.compile(r'(\bmembers\s+\[\s*)(\d+(?:\.\d+)?)(:\d+)', re.M),
-            replace_rt, text, "community members AS:tag")
+            text = self._sub(
+                re.compile(r'(\bmembers\s+\[\s*)(\d+(?:\.\d+)?)(:\d+)', re.M),
+                replace_rt, text, "community members AS:tag")
 
-        # inline community value after "community NAME members"
-        text = self._sub(
-            re.compile(r'(\s)(\d{4,5})(:\d+)(?=\s|;|\])', re.M),
-            replace_rt, text, "community value AS:tag (inline)")
+            text = self._sub(
+                re.compile(r'(\s)(\d{4,5})(:\d+)(?=\s|;|\])', re.M),
+                replace_rt, text, "community value AS:tag (inline)")
 
         return text
 
@@ -600,207 +870,223 @@ class JuniperSanitiser:
 
     def _pass_named_objects(self, text: str) -> str:
         N = self._sub_name
+        C = self.cfg.enabled
 
-        # ── Hostname ──────────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+system\s+host-name\s+)(?P<n>\S+)', re.M),
-                 "hostname", "host-name (set)", text)
+        # ── identity ──────────────────────────────────────────────────────
 
-        text = N(re.compile(r'^(\s*host-name\s+)(?P<n>\S+)\s*;', re.M),
-                 "hostname", "host-name (block)", text)
+        if C("hostname"):
+            text = N(re.compile(r'^(set\s+system\s+host-name\s+)(?P<n>\S+)', re.M),
+                     "hostname", "host-name (set)", text)
+            text = N(re.compile(r'^(\s*host-name\s+)(?P<n>\S+)\s*;', re.M),
+                     "hostname", "host-name (block)", text)
 
-        # ── Domain name ───────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+system\s+domain-name\s+)(?P<n>\S+)', re.M),
-                 "domain", "domain-name (set)", text)
+        if C("domain-name"):
+            text = N(re.compile(r'^(set\s+system\s+domain-name\s+)(?P<n>\S+)', re.M),
+                     "domain", "domain-name (set)", text)
+            text = N(re.compile(r'^(\s*domain-name\s+)(?P<n>\S+)\s*;', re.M),
+                     "domain", "domain-name (block)", text)
+            text = N(re.compile(r'^(set\s+system\s+domain-search\s+)(?P<n>\S+)', re.M),
+                     "domain", "domain-search (set)", text)
 
-        text = N(re.compile(r'^(\s*domain-name\s+)(?P<n>\S+)\s*;', re.M),
-                 "domain", "domain-name (block)", text)
+        if C("usernames"):
+            text = N(re.compile(r'^(set\s+system\s+login\s+user\s+)(?P<n>\S+)', re.M),
+                     "username", "login user (set)", text)
+            text = N(re.compile(r'^(\s*user\s+)(?P<n>(?!name\b)\S+)\s*\{', re.M),
+                     "username", "login user (block)", text)
 
-        text = N(re.compile(r'^(set\s+system\s+domain-search\s+)(?P<n>\S+)', re.M),
-                 "domain", "domain-search (set)", text)
+        # ── aaa-objects ───────────────────────────────────────────────────
 
-        # ── Usernames ─────────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+system\s+login\s+user\s+)(?P<n>\S+)', re.M),
-                 "username", "login user (set)", text)
+        if C("aaa-profiles"):
+            text = N(re.compile(r'^(set\s+access\s+profile\s+)(?P<n>\S+)', re.M),
+                     "aaa_profile", "access profile name (set)", text)
 
-        # block: "user NAME { ..."
-        text = N(re.compile(r'^(\s*user\s+)(?P<n>(?!name\b)\S+)\s*\{', re.M),
-                 "username", "login user (block)", text)
+        # ── network-objects ───────────────────────────────────────────────
 
-        # ── RADIUS / TACACS+ server names ─────────────────────────────────
-        # set access profile NAME ...
-        text = N(re.compile(r'^(set\s+access\s+profile\s+)(?P<n>\S+)', re.M),
-                 "aaa_profile", "access profile name (set)", text)
+        if C("routing-instances"):
+            text = N(re.compile(r'^(set\s+routing-instances\s+)(?P<n>\S+)', re.M),
+                     "routing_instance", "routing-instance (set)", text)
+            text = N(re.compile(r'^(\s*instance\s+)(?P<n>\S+)\s*\{', re.M),
+                     "routing_instance", "routing-instance (block)", text)
+            text = N(re.compile(
+                r'(\binstance\s+)(?P<n>(?!type\b|master\b)\S+)(?=\s*[;{])', re.M),
+                     "routing_instance", "routing-instance ref (block)", text)
 
-        # set access radius-server IP ... (IP anonymised by IP pass; label the stanza)
-        # set access tacplus-server IP ...
-        # Server IPs are handled by the IP pass — no named tokens needed here
+        if C("security-zones"):
+            text = N(re.compile(
+                r'^(set\s+security\s+zones\s+security-zone\s+)(?P<n>\S+)', re.M),
+                     "security_zone", "security-zone def (set)", text)
+            text = N(re.compile(r'^(\s*security-zone\s+)(?P<n>\S+)\s*\{', re.M),
+                     "security_zone", "security-zone def (block)", text)
+            text = N(re.compile(r'(\bfrom-zone\s+)(?P<n>\S+)(?=\s)', re.M),
+                     "security_zone", "from-zone ref", text)
+            text = N(re.compile(r'(\bto-zone\s+)(?P<n>\S+)(?=\s)', re.M),
+                     "security_zone", "to-zone ref", text)
 
-        # ── Routing instances (VRF equivalent) ────────────────────────────
-        text = N(re.compile(r'^(set\s+routing-instances\s+)(?P<n>\S+)', re.M),
-                 "routing_instance", "routing-instance (set)", text)
+        if C("address-books"):
+            text = N(re.compile(
+                r'^(set\s+security\s+address-book\s+)(?P<n>(?!global\b)\S+)', re.M),
+                     "address_book", "address-book def (set)", text)
 
-        text = N(re.compile(r'^(\s*instance\s+)(?P<n>\S+)\s*\{', re.M),
-                 "routing_instance", "routing-instance (block)", text)
+        if C("nat-rulesets"):
+            text = N(re.compile(
+                r'^(set\s+security\s+nat\s+\S+\s+rule-set\s+)(?P<n>\S+)', re.M),
+                     "nat_ruleset", "NAT rule-set def (set)", text)
 
-        # routing-instance refs (export / import policy application)
-        text = N(re.compile(
-            r'(\binstance\s+)(?P<n>(?!type\b|master\b)\S+)(?=\s*[;{])', re.M),
-                 "routing_instance", "routing-instance ref (block)", text)
+        # ── routing-policy ────────────────────────────────────────────────
 
-        # ── Routing policies ──────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+policy-options\s+policy-statement\s+)(?P<n>\S+)', re.M),
-                 "routing_policy", "policy-statement def (set)", text)
+        if C("policy-statements"):
+            text = N(re.compile(
+                r'^(set\s+policy-options\s+policy-statement\s+)(?P<n>\S+)', re.M),
+                     "routing_policy", "policy-statement def (set)", text)
+            text = N(re.compile(r'^(\s*policy-statement\s+)(?P<n>\S+)\s*\{', re.M),
+                     "routing_policy", "policy-statement def (block)", text)
+            text = N(re.compile(
+                r'^(set\s+(?:routing-instances\s+\S+\s+)?protocols\s+\S+.*?\s+'
+                r'(?:export|import)\s+)(?P<n>[A-Za-z]\S*)', re.M),
+                     "routing_policy",
+                     "routing protocol export/import policy ref (set)", text)
+            text = N(re.compile(
+                r'^(set\s+routing-options\s+(?:static\s+\S+\s+)?'
+                r'(?:export|import)\s+)(?P<n>[A-Za-z]\S*)', re.M),
+                     "routing_policy", "routing-options policy ref (set)", text)
+            text = N(re.compile(
+                r'(\b(?:export|import)\s+)(?P<n>(?!\[)[A-Za-z]\S*)(?=\s*[;])',
+                re.M),
+                     "routing_policy", "export/import policy ref (block)", text)
 
-        text = N(re.compile(r'^(\s*policy-statement\s+)(?P<n>\S+)\s*\{', re.M),
-                 "routing_policy", "policy-statement def (block)", text)
+        if C("firewall-filters"):
+            text = N(re.compile(
+                r'^(set\s+firewall\s+(?:family\s+\S+\s+)?filter\s+)(?P<n>\S+)',
+                re.M),
+                     "firewall_filter", "firewall filter def (set)", text)
+            text = N(re.compile(
+                r'^(\s*filter\s+)'
+                r'(?P<n>(?!input\b|output\b|input-list\b|output-list\b)\S+)\s*\{',
+                re.M),
+                     "firewall_filter", "firewall filter def (block)", text)
+            text = N(re.compile(
+                r'^(set\s+interfaces\s+\S+\s+.*?filter\s+(?:input|output)\s+)'
+                r'(?P<n>\S+)', re.M),
+                     "firewall_filter", "firewall filter ref (interface, set)", text)
+            text = N(re.compile(
+                r'(\bfilter\s+(?:input|output)\s+)(?P<n>\S+)(?=\s*;)', re.M),
+                     "firewall_filter", "firewall filter ref (block)", text)
 
-        # export / import policy refs
-        text = N(re.compile(
-            r'^(set\s+(?:routing-instances\s+\S+\s+)?protocols\s+\S+.*?\s+'
-            r'(?:export|import)\s+)(?P<n>[A-Za-z]\S*)', re.M),
-                 "routing_policy", "routing protocol export/import policy ref (set)", text)
+        if C("prefix-lists"):
+            text = N(re.compile(
+                r'^(set\s+policy-options\s+prefix-list\s+)(?P<n>\S+)', re.M),
+                     "prefix_list", "prefix-list def (set)", text)
+            text = N(re.compile(r'^(\s*prefix-list\s+)(?P<n>\S+)\s*\{', re.M),
+                     "prefix_list", "prefix-list def (block)", text)
+            text = N(re.compile(r'(\bprefix-list\s+)(?P<n>\S+)(?=\s*;)', re.M),
+                     "prefix_list", "prefix-list ref", text)
 
-        text = N(re.compile(
-            r'^(set\s+routing-options\s+(?:static\s+\S+\s+)?(?:export|import)\s+)(?P<n>[A-Za-z]\S*)', re.M),
-                 "routing_policy", "routing-options policy ref (set)", text)
+        if C("communities"):
+            text = N(re.compile(
+                r'^(set\s+policy-options\s+community\s+)(?P<n>\S+)', re.M),
+                     "community", "community def (set)", text)
+            text = N(re.compile(
+                r'^(\s*community\s+)(?P<n>(?!delete\b|add\b|set\b)\S+)\s*\{',
+                re.M),
+                     "community", "community def (block)", text)
+            text = N(re.compile(
+                r'(\bcommunity\s+(?:add\s+|delete\s+|set\s+)?)'
+                r'(?P<n>[A-Za-z]\S*)(?=\s*;)', re.M),
+                     "community", "community ref", text)
 
-        # generic policy refs in block format: export [ POLICY1 POLICY2 ];
-        text = N(re.compile(
-            r'(\b(?:export|import)\s+)(?P<n>(?!\[)[A-Za-z]\S*)(?=\s*[;])', re.M),
-                 "routing_policy", "export/import policy ref (block)", text)
+        # ── bgp-objects ───────────────────────────────────────────────────
 
-        # ── Firewall filters (ACL equivalent) ─────────────────────────────
-        text = N(re.compile(r'^(set\s+firewall\s+(?:family\s+\S+\s+)?filter\s+)(?P<n>\S+)', re.M),
-                 "firewall_filter", "firewall filter def (set)", text)
+        if C("bgp-groups"):
+            text = N(re.compile(
+                r'^(set\s+protocols\s+bgp\s+group\s+)(?P<n>\S+)', re.M),
+                     "bgp_group", "BGP group def (set)", text)
+            text = N(re.compile(r'^(\s*group\s+)(?P<n>(?!bgp\b)\S+)\s*\{', re.M),
+                     "bgp_group", "BGP group def (block)", text)
 
-        text = N(re.compile(r'^(\s*filter\s+)(?P<n>(?!input\b|output\b|input-list\b|output-list\b)\S+)\s*\{', re.M),
-                 "firewall_filter", "firewall filter def (block)", text)
+        # ── vpn-objects ───────────────────────────────────────────────────
 
-        # filter refs: "set interfaces xe-0/0/0 unit 0 family inet filter input FILTER-NAME"
-        text = N(re.compile(
-            r'^(set\s+interfaces\s+\S+\s+.*?filter\s+(?:input|output)\s+)(?P<n>\S+)', re.M),
-                 "firewall_filter", "firewall filter ref (interface, set)", text)
+        if C("ike-proposals"):
+            text = N(re.compile(
+                r'^(set\s+security\s+ike\s+proposal\s+)(?P<n>\S+)', re.M),
+                     "ike_proposal", "IKE proposal def (set)", text)
+            text = N(re.compile(r'^(\s*proposal\s+)(?P<n>\S+)\s*\{', re.M),
+                     "ike_proposal", "IKE/IPsec proposal def (block)", text)
 
-        # block: filter { input FILTER-NAME; }
-        text = N(re.compile(
-            r'(\bfilter\s+(?:input|output)\s+)(?P<n>\S+)(?=\s*;)', re.M),
-                 "firewall_filter", "firewall filter ref (block)", text)
+        if C("ike-policies"):
+            text = N(re.compile(
+                r'^(set\s+security\s+ike\s+policy\s+)(?P<n>\S+)', re.M),
+                     "ike_policy", "IKE policy def (set)", text)
+            text = N(re.compile(
+                r'^(\s*policy\s+)(?P<n>(?!default\b)\S+)\s*\{', re.M),
+                     "ike_policy", "IKE policy def (block)", text)
 
-        # ── Prefix lists ──────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+policy-options\s+prefix-list\s+)(?P<n>\S+)', re.M),
-                 "prefix_list", "prefix-list def (set)", text)
+        if C("ike-gateways"):
+            text = N(re.compile(
+                r'^(set\s+security\s+ike\s+gateway\s+)(?P<n>\S+)', re.M),
+                     "ike_gateway", "IKE gateway def (set)", text)
+            text = N(re.compile(r'^(\s*gateway\s+)(?P<n>\S+)\s*\{', re.M),
+                     "ike_gateway", "IKE gateway def (block)", text)
 
-        text = N(re.compile(r'^(\s*prefix-list\s+)(?P<n>\S+)\s*\{', re.M),
-                 "prefix_list", "prefix-list def (block)", text)
+        if C("ipsec-proposals"):
+            text = N(re.compile(
+                r'^(set\s+security\s+ipsec\s+proposal\s+)(?P<n>\S+)', re.M),
+                     "ipsec_proposal", "IPsec proposal def (set)", text)
 
-        # ref: "from prefix-list NAME"
-        text = N(re.compile(r'(\bprefix-list\s+)(?P<n>\S+)(?=\s*;)', re.M),
-                 "prefix_list", "prefix-list ref", text)
+        if C("ipsec-policies"):
+            text = N(re.compile(
+                r'^(set\s+security\s+ipsec\s+policy\s+)(?P<n>\S+)', re.M),
+                     "ipsec_policy", "IPsec policy def (set)", text)
 
-        # ── Communities ───────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+policy-options\s+community\s+)(?P<n>\S+)', re.M),
-                 "community", "community def (set)", text)
+        if C("ipsec-vpns"):
+            text = N(re.compile(
+                r'^(set\s+security\s+ipsec\s+vpn\s+)(?P<n>\S+)', re.M),
+                     "ipsec_vpn", "IPsec VPN def (set)", text)
 
-        text = N(re.compile(r'^(\s*community\s+)(?P<n>(?!delete\b|add\b|set\b)\S+)\s*\{', re.M),
-                 "community", "community def (block)", text)
+        # ── cos-objects ───────────────────────────────────────────────────
 
-        # community refs: "from community NAME" / "then community add NAME"
-        text = N(re.compile(
-            r'(\bcommunity\s+(?:add\s+|delete\s+|set\s+)?)(?P<n>[A-Za-z]\S*)(?=\s*;)', re.M),
-                 "community", "community ref", text)
+        if C("cos-schedulers"):
+            text = N(re.compile(
+                r'^(set\s+class-of-service\s+schedulers\s+)(?P<n>\S+)', re.M),
+                     "cos_scheduler", "CoS scheduler def (set)", text)
 
-        # ── BGP groups ────────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+protocols\s+bgp\s+group\s+)(?P<n>\S+)', re.M),
-                 "bgp_group", "BGP group def (set)", text)
+        if C("cos-classifiers"):
+            text = N(re.compile(
+                r'^(set\s+class-of-service\s+classifiers\s+\S+\s+)(?P<n>\S+)',
+                re.M),
+                     "cos_classifier", "CoS classifier def (set)", text)
 
-        text = N(re.compile(r'^(\s*group\s+)(?P<n>(?!bgp\b)\S+)\s*\{', re.M),
-                 "bgp_group", "BGP group def (block)", text)
+        if C("cos-forwarding-classes"):
+            text = N(re.compile(
+                r'^(set\s+class-of-service\s+forwarding-classes\s+class\s+)'
+                r'(?P<n>\S+)', re.M),
+                     "cos_fwdclass", "CoS forwarding-class def (set)", text)
 
-        # ── IKE proposals, policies, gateways ────────────────────────────
-        text = N(re.compile(r'^(set\s+security\s+ike\s+proposal\s+)(?P<n>\S+)', re.M),
-                 "ike_proposal", "IKE proposal def (set)", text)
+        if C("cos-scheduler-maps"):
+            text = N(re.compile(
+                r'^(set\s+class-of-service\s+interfaces\s+\S+\s+scheduler-map\s+)'
+                r'(?P<n>\S+)', re.M),
+                     "cos_policy", "CoS scheduler-map ref (set)", text)
+            text = N(re.compile(
+                r'^(set\s+class-of-service\s+scheduler-maps\s+)(?P<n>\S+)', re.M),
+                     "cos_policy", "CoS scheduler-map def (set)", text)
 
-        text = N(re.compile(r'^(set\s+security\s+ike\s+policy\s+)(?P<n>\S+)', re.M),
-                 "ike_policy", "IKE policy def (set)", text)
+        # ── ntp-objects ───────────────────────────────────────────────────
 
-        text = N(re.compile(r'^(set\s+security\s+ike\s+gateway\s+)(?P<n>\S+)', re.M),
-                 "ike_gateway", "IKE gateway def (set)", text)
-
-        # block variants
-        text = N(re.compile(r'^(\s*proposal\s+)(?P<n>\S+)\s*\{', re.M),
-                 "ike_proposal", "IKE/IPsec proposal def (block)", text)
-
-        text = N(re.compile(r'^(\s*policy\s+)(?P<n>(?!default\b)\S+)\s*\{', re.M),
-                 "ike_policy", "IKE policy def (block)", text)
-
-        text = N(re.compile(r'^(\s*gateway\s+)(?P<n>\S+)\s*\{', re.M),
-                 "ike_gateway", "IKE gateway def (block)", text)
-
-        # ── IPsec proposals, policies, VPNs ──────────────────────────────
-        text = N(re.compile(r'^(set\s+security\s+ipsec\s+proposal\s+)(?P<n>\S+)', re.M),
-                 "ipsec_proposal", "IPsec proposal def (set)", text)
-
-        text = N(re.compile(r'^(set\s+security\s+ipsec\s+policy\s+)(?P<n>\S+)', re.M),
-                 "ipsec_policy", "IPsec policy def (set)", text)
-
-        text = N(re.compile(r'^(set\s+security\s+ipsec\s+vpn\s+)(?P<n>\S+)', re.M),
-                 "ipsec_vpn", "IPsec VPN def (set)", text)
-
-        # ── Security zones ────────────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+security\s+zones\s+security-zone\s+)(?P<n>\S+)', re.M),
-                 "security_zone", "security-zone def (set)", text)
-
-        text = N(re.compile(r'^(\s*security-zone\s+)(?P<n>\S+)\s*\{', re.M),
-                 "security_zone", "security-zone def (block)", text)
-
-        # from-zone / to-zone refs
-        text = N(re.compile(r'(\bfrom-zone\s+)(?P<n>\S+)(?=\s)', re.M),
-                 "security_zone", "from-zone ref", text)
-
-        text = N(re.compile(r'(\bto-zone\s+)(?P<n>\S+)(?=\s)', re.M),
-                 "security_zone", "to-zone ref", text)
-
-        # ── Address books ─────────────────────────────────────────────────
-        text = N(re.compile(
-            r'^(set\s+security\s+address-book\s+)(?P<n>(?!global\b)\S+)', re.M),
-                 "address_book", "address-book def (set)", text)
-
-        # ── NAT rule-sets ─────────────────────────────────────────────────
-        text = N(re.compile(
-            r'^(set\s+security\s+nat\s+\S+\s+rule-set\s+)(?P<n>\S+)', re.M),
-                 "nat_ruleset", "NAT rule-set def (set)", text)
-
-        # ── Class of Service (CoS) ────────────────────────────────────────
-        text = N(re.compile(r'^(set\s+class-of-service\s+schedulers\s+)(?P<n>\S+)', re.M),
-                 "cos_scheduler", "CoS scheduler def (set)", text)
-
-        text = N(re.compile(r'^(set\s+class-of-service\s+classifiers\s+\S+\s+)(?P<n>\S+)', re.M),
-                 "cos_classifier", "CoS classifier def (set)", text)
-
-        text = N(re.compile(r'^(set\s+class-of-service\s+forwarding-classes\s+class\s+)(?P<n>\S+)', re.M),
-                 "cos_fwdclass", "CoS forwarding-class def (set)", text)
-
-        text = N(re.compile(r'^(set\s+class-of-service\s+interfaces\s+\S+\s+scheduler-map\s+)(?P<n>\S+)', re.M),
-                 "cos_policy", "CoS scheduler-map ref (set)", text)
-
-        text = N(re.compile(r'^(set\s+class-of-service\s+scheduler-maps\s+)(?P<n>\S+)', re.M),
-                 "cos_policy", "CoS scheduler-map def (set)", text)
-
-        # ── NTP authentication key IDs ────────────────────────────────────
-        # set system ntp authentication-key N type md5 value "..."
-        # Key ID is a number; tokenise so it's consistent (value redacted in pass 1)
-        text = N(re.compile(r'^(set\s+system\s+ntp\s+authentication-key\s+)(?P<n>\d+)', re.M),
-                 "keychain", "NTP authentication-key ID (set)", text)
-
-        # NTP trusted-key ref
-        text = N(re.compile(r'^(set\s+system\s+ntp\s+trusted-key\s+)(?P<n>\d+)', re.M),
-                 "keychain", "NTP trusted-key ref (set)", text)
+        if C("ntp-key-ids"):
+            text = N(re.compile(
+                r'^(set\s+system\s+ntp\s+authentication-key\s+)(?P<n>\d+)', re.M),
+                     "keychain", "NTP authentication-key ID (set)", text)
+            text = N(re.compile(
+                r'^(set\s+system\s+ntp\s+trusted-key\s+)(?P<n>\d+)', re.M),
+                     "keychain", "NTP trusted-key ref (set)", text)
 
         return text
 
     # ──────────────────────────────── pass 5: descriptions ───────────────
 
     def _pass_descriptions(self, text: str) -> str:
+        C = self.cfg.enabled
+
         def repl(m: re.Match) -> str:
             prefix = m.group(1)
             desc = m.group(2)
@@ -808,16 +1094,16 @@ class JuniperSanitiser:
                 return m.group(0)
             return prefix + self.tokens.get("description", desc)
 
-        # set-format: set ... description "..."  or  set ... description text
-        text = self._sub(
-            re.compile(r'^(set\s+.*?\s+description\s+)(.+)$', re.M),
-            repl, text, "set-format description lines")
+        if C("set-descriptions"):
+            text = self._sub(
+                re.compile(r'^(set\s+.*?\s+description\s+)(.+)$', re.M),
+                repl, text, "set-format description lines")
 
-        # block-format: description "...";  or  description text;
-        text = self._sub(
-            re.compile(r'^(\s*description\s+)(.+?)\s*;$', re.M),
-            lambda m: repl(m) + ';' if not repl(m).endswith(';') else repl(m),
-            text, "block-format description lines")
+        if C("block-descriptions"):
+            text = self._sub(
+                re.compile(r'^(\s*description\s+)(.+?)\s*;$', re.M),
+                lambda m: repl(m) + ';' if not repl(m).endswith(';') else repl(m),
+                text, "block-format description lines")
 
         return text
 
@@ -848,95 +1134,105 @@ def parse_args() -> argparse.Namespace:
         description="Sanitise Juniper Junos configuration files (set-format and curly-brace).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Selection flags (all accept comma-separated lists):
+  --skip-group   credentials,snmp     skip entire groups
+  --only-group   named-objects        run only these groups
+  --skip-pass    routing-auth,pki     skip specific passes
+  --only-pass    identity,bgp-objects run only these passes
+  --skip         ntp-keys,ospf-keys   skip specific items
+  --only         hostname,bgp-keys    run only these items
+
+Run --list-items to see all valid group, pass, and item IDs.
+
+Precedence (lowest → highest): group → pass → item.
+--skip and --only are mutually exclusive at the same level.
+
 Examples:
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --seed myproject
   python juniper_sanitise.py -i router.conf -o router_clean.conf --dump-map map.json
   python juniper_sanitise.py -i router.conf --dry-run
   python juniper_sanitise.py -i ./configs/ -o ./clean/ --no-ips --no-descriptions
+  python juniper_sanitise.py -i router.conf --skip-group credentials
+  python juniper_sanitise.py -i router.conf --only-group named-objects,addressing
+  python juniper_sanitise.py -i router.conf --skip ntp-keys,login-banner
+  python juniper_sanitise.py --list-items
         """
     )
-    p.add_argument("-i", "--input",     required=True,
+    p.add_argument("-i", "--input",      required=False,
                    help="Input file or directory")
-    p.add_argument("-o", "--output",    required=False,
+    p.add_argument("-o", "--output",     required=False,
                    help="Output file or directory")
-    p.add_argument("--seed",            default="juniper-sanitise",
+    p.add_argument("--seed",             default="juniper-sanitise",
                    help="Determinism seed — same seed = same tokens every run")
-    p.add_argument("--no-ips",          action="store_true",
-                   help="Skip IP address anonymisation")
-    p.add_argument("--no-descriptions", action="store_true",
-                   help="Skip description line anonymisation")
-    p.add_argument("--dump-map",        metavar="FILE",
+
+    # ── Legacy flags (retained as aliases) ───────────────────────────────
+    p.add_argument("--no-ips",           action="store_true",
+                   help="Skip IP address anonymisation (alias for --skip-group addressing)")
+    p.add_argument("--no-descriptions",  action="store_true",
+                   help="Skip description anonymisation (alias for --skip-pass descriptions)")
+
+    # ── Selection flags ───────────────────────────────────────────────────
+    p.add_argument("--skip-group",       metavar="GROUPS",
+                   help="Comma-separated groups to skip")
+    p.add_argument("--only-group",       metavar="GROUPS",
+                   help="Comma-separated groups to run (all others skipped)")
+    p.add_argument("--skip-pass",        metavar="PASSES",
+                   help="Comma-separated passes to skip")
+    p.add_argument("--only-pass",        metavar="PASSES",
+                   help="Comma-separated passes to run (all others skipped)")
+    p.add_argument("--skip",             metavar="ITEMS",
+                   help="Comma-separated items to skip")
+    p.add_argument("--only",             metavar="ITEMS",
+                   help="Comma-separated items to run (all others skipped)")
+
+    # ── Utility ───────────────────────────────────────────────────────────
+    p.add_argument("--list-items",       action="store_true",
+                   help="Print all valid group/pass/item IDs and exit")
+    p.add_argument("--dump-map",         metavar="FILE",
                    help="Write full original→token mapping to a JSON file")
-    p.add_argument("--dry-run",         action="store_true",
+    p.add_argument("--dry-run",          action="store_true",
                    help="Print sanitised output to stdout; do not write files")
-    p.add_argument("--extensions",      default=".conf,.txt,.cfg,.log",
+    p.add_argument("--extensions",       default=".conf,.txt,.cfg,.log",
                    help="Comma-separated file extensions to process")
     return p.parse_args()
 
 
-# Repository URL — update this when the project is published.
-# This value is embedded in the sanitised-configuration banner.
-REPO_URL = "https://github.com/spaldingd/config-sanitiser-juniper"
-
-
-def _seed_fingerprint(seed: str) -> str:
-    """
-    Return a 16-character hex fingerprint of the seed (first 64 bits of
-    SHA-256). This is published in the sanitised-output banner so that two
-    files can be verified as sharing the same seed (and therefore having
-    consistent tokens) without exposing the seed itself.
-
-    The seed is intentionally kept secret because, combined with the script,
-    it enables forward-lookup against guessable values — most critically,
-    IP addresses, where exhaustive enumeration of RFC 1918 space is trivial.
-    A fingerprint preserves the diff-ability use-case while eliminating that
-    risk.
-    """
-    return hashlib.sha256(seed.encode()).hexdigest()[:16]
-
-
-def _sanitised_banner(seed: str, anonymise_ips: bool,
-                      anonymise_descriptions: bool) -> str:
-    """
-    Return a comment block to prepend to every sanitised output file.
-    Uses '!' as the comment character.
-    The action list is dynamic — IP and description lines are only included when
-    those passes are active.
-    The seed fingerprint (not the seed itself) is included so that two sanitised
-    files can be confirmed as using the same seed without exposing it.
-    """
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    fingerprint = _seed_fingerprint(seed)
-    actions = [
-        "credentials and keys replaced with <REMOVED>",
-        "named objects (hostnames, VRFs, ACLs, route-maps, etc.) replaced with"
-        " opaque tokens",
+def _active_config_summary(cfg: SanitiserConfig) -> str:
+    """Return a compact human-readable summary of what is enabled/disabled."""
+    disabled_groups = [
+        g for g, items in _GROUP_TO_ITEMS.items()
+        if not items.intersection(cfg.enabled_items)
     ]
-    if anonymise_ips:
-        actions.append(
-            "IP addresses (IPv4 and IPv6) replaced with opaque tokens")
-    if anonymise_descriptions:
-        actions.append("description text replaced with opaque tokens")
-
-    sep = "!" + "=" * 69
-    lines = [
-        sep,
-        "! SANITISED CONFIGURATION",
-        "! This file has been processed by juniper_sanitise.py.",
-        "! Original sensitive data has been replaced as follows:",
-        "!",
+    partial_groups = [
+        g for g, items in _GROUP_TO_ITEMS.items()
+        if items.intersection(cfg.enabled_items) and not items.issubset(cfg.enabled_items)
     ]
-    for action in actions:
-        lines.append(f"!   - {action}")
-    lines += [
-        "!",
-        f"! Sanitised   : {now}",
-        f"! Seed hash   : {fingerprint}  (SHA-256 fingerprint — not the seed itself)",
-        f"! Script      : {REPO_URL}",
-        sep,
-        "",   # blank line before the config body begins
-    ]
-    return "\n".join(lines) + "\n"
+    if not disabled_groups and not partial_groups:
+        return "All actions enabled (default)"
+    parts = []
+    if disabled_groups:
+        parts.append(f"Groups skipped: {', '.join(disabled_groups)}")
+    if partial_groups:
+        # Show which passes are fully disabled within partial groups
+        skipped_passes = [
+            p for p, items in _PASS_TO_ITEMS.items()
+            if not items.intersection(cfg.enabled_items)
+        ]
+        if skipped_passes:
+            parts.append(f"Passes skipped: {', '.join(skipped_passes)}")
+        # Show individual disabled items not covered by a fully-skipped pass
+        skipped_pass_items = frozenset(
+            item
+            for p in skipped_passes
+            for item in _PASS_TO_ITEMS[p]
+        )
+        lone_disabled = [
+            i for i in ALL_ITEM_IDS
+            if i not in cfg.enabled_items and i not in skipped_pass_items
+        ]
+        if lone_disabled:
+            parts.append(f"Items skipped: {', '.join(sorted(lone_disabled))}")
+    return "  /  ".join(parts)
 
 
 def process_file(path: Path, dest: "Path | None",
@@ -966,11 +1262,23 @@ def process_file(path: Path, dest: "Path | None",
 
 def main() -> None:
     args = parse_args()
-    sanitiser = JuniperSanitiser(
-        seed=args.seed,
-        anonymise_ips=not args.no_ips,
-        anonymise_descriptions=not args.no_descriptions,
-    )
+
+    if args.list_items:
+        print_list_items()
+        sys.exit(0)
+
+    if not args.input:
+        print("ERROR: -i / --input is required unless using --list-items.")
+        sys.exit(1)
+
+    try:
+        cfg = resolve_config(args)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    sanitiser = JuniperSanitiser(seed=args.seed, cfg=cfg)
+
     exts = tuple(e if e.startswith(".") else f".{e}"
                  for e in args.extensions.split(","))
     inp = Path(args.input)
@@ -981,8 +1289,7 @@ def main() -> None:
     print("║  Junos  ·  set-format  ·  curly-brace format            ║")
     print("╚══════════════════════════════════════════════════════════╝")
     print(f"  Seed            : {args.seed}")
-    print(f"  Anonymise IPs   : {'No' if args.no_ips else 'Yes (IPv4-xxxx / IPv6-xxxx tokens)'}")
-    print(f"  Anonymise descs : {'No' if args.no_descriptions else 'Yes'}")
+    print(f"  Active config   : {_active_config_summary(cfg)}")
     print(f"  Dry run         : {'Yes' if args.dry_run else 'No'}")
 
     success = failure = 0
